@@ -169,6 +169,19 @@ export class ApiClient {
         return response.machines;
     }
 
+    public async set_machine_alias(machine_id: string, alias: string) {
+        await this.client.put(`/machines/${machine_id}/alias`, { alias });
+    }
+
+    public async get_machine_tags(machine_id: string): Promise<Array<string>> {
+        const response = await this.client.get<any, { tags: Array<string> }>(`/machines/${machine_id}/tags`);
+        return response.tags;
+    }
+
+    public async set_machine_tags(machine_id: string, tags: Array<string>) {
+        await this.client.put(`/machines/${machine_id}/tags`, { tags });
+    }
+
     public async get_summary(): Promise<Summary> {
         const response = await this.client.get<any, Summary>('/summary');
         return response;

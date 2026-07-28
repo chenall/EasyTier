@@ -91,22 +91,63 @@ export interface DeviceInfo {
     running_network_instances?: Array<string>;
     machine_id: string;
     location: Location | undefined;
+    alias?: string;
+    online?: boolean;
+    last_seen_at?: string;
+    tags?: Array<string>;
 }
 
 export function buildDeviceInfo(device: any): DeviceInfo {
     const runningInstances = device.info?.running_network_instances ?? [];
     let dev_info: DeviceInfo = {
-        hostname: device.info?.hostname,
+        // Prefer registry-sourced fields so OFFLINE devices (whose live `info`
+        // is absent) still surface their last-known hostname/version and a stable
+        // machine_id. Fall back to `info` for online-only extras.
+        hostname: device.hostname ?? device.info?.hostname,
+        easytier_version: device.easytier_version ?? device.info?.easytier_version,
+        machine_id: device.machine_id ?? UuidToStr(device.info?.machine_id),
         public_ip: device.client_url,
         running_network_instances: runningInstances.map((instance: any) => UuidToStr(instance)),
         running_network_count: runningInstances.length,
         report_time: device.info?.report_time,
-        easytier_version: device.info?.easytier_version,
-        machine_id: UuidToStr(device.info?.machine_id),
         location: device.location,
+        alias: device.alias ?? '',
+        online: device.online ?? false,
+        last_seen_at: device.last_seen_at ?? '',
+        tags: device.tags ?? [],
     };
 
     return dev_info;
+}
+
+/**
+ * 将 ISO 时间戳格式化为相对时间，如「5 分钟前」「3 小时前」「2 天前」。
+ * 离线设备展示 last_seen_at 时可直观体现「多久没心跳」。
+ * 使用内置 Intl.RelativeTimeFormat，无第三方依赖；不传 locale 时使用运行环境默认（浏览器即用户语言）。
+ */
+export function formatRelativeTime(iso: string | undefined | null, locale?: string): string {
+    if (!iso) {
+        return '';
+    }
+    const then = new Date(iso).getTime();
+    if (Number.isNaN(then)) {
+        return iso;
+    }
+    const diffSec = Math.round((then - Date.now()) / 1000);
+    const rtf = new Intl.RelativeTimeFormat(locale, { numeric: 'auto' });
+    if (Math.abs(diffSec) < 60) {
+        return rtf.format(Math.round(diffSec), 'second');
+    }
+    const min = Math.round(diffSec / 60);
+    if (Math.abs(min) < 60) {
+        return rtf.format(min, 'minute');
+    }
+    const hr = Math.round(diffSec / 3600);
+    if (Math.abs(hr) < 24) {
+        return rtf.format(hr, 'hour');
+    }
+    const day = Math.round(diffSec / 86400);
+    return rtf.format(day, 'day');
 }
 
 // write a class to run a function periodically and can be stopped by calling stop(), use setTimeout to trigger the function

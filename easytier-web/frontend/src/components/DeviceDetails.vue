@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { computed } from 'vue';
 import { Utils } from 'easytier-frontend-lib';
 import { useI18n } from 'vue-i18n'
 
@@ -6,13 +7,17 @@ const { t } = useI18n()
 
 
 // 定义组件接收的 props
-defineProps<{
+const props = defineProps<{
   device: Utils.DeviceInfo;
   // 可以传入额外的样式类
   containerClass?: string;
   // 是否使用紧凑布局
   compact?: boolean;
 }>();
+
+// 最近在线时间格式化为相对时间（如「5 分钟前」）。
+// 离线设备 last_seen_at 仍有值，可直观体现「多久没心跳」。
+const lastSeenAgo = computed(() => Utils.formatRelativeTime(props.device.last_seen_at));
 
 </script>
 
@@ -21,6 +26,24 @@ defineProps<{
     <div class="detail-item hostname">
       <div class="detail-label">{{ t('web.device.hostname') }}</div>
       <div class="detail-value">{{ device.hostname }}</div>
+    </div>
+    <div class="detail-item alias" v-if="device.alias">
+      <div class="detail-label">{{ t('web.device.alias') }}</div>
+      <div class="detail-value">{{ device.alias }}</div>
+    </div>
+    <div class="detail-item status">
+      <div class="detail-label">{{ t('web.device.status') }}</div>
+      <div class="detail-value">
+        <span class="status-dot" :class="device.online ? 'online' : 'offline'"></span>
+        <span class="status-text">{{ device.online ? t('web.device.online') : t('web.device.offline') }}</span>
+        <span v-if="device.last_seen_at" class="last-seen">· {{ t('web.device.last_seen') }} {{ lastSeenAgo }}</span>
+      </div>
+    </div>
+    <div class="detail-item tags" v-if="(device.tags ?? []).length">
+      <div class="detail-label">{{ t('web.device.tags') }}</div>
+      <div class="detail-value tag-values">
+        <span v-for="tag in device.tags" :key="tag" class="device-tag-chip">{{ tag }}</span>
+      </div>
     </div>
     <div class="detail-item public-ip">
       <div class="detail-label">{{ t('web.device.public_ip') }}</div>
@@ -156,6 +179,65 @@ defineProps<{
 .machine-id .detail-label::before {
   background-color: #6b7280;
   /* 灰色 */
+}
+
+/* 状态与标签 */
+.status-dot {
+  display: inline-block;
+  width: 0.55rem;
+  height: 0.55rem;
+  border-radius: 50%;
+  vertical-align: middle;
+  margin-right: 0.35rem;
+}
+
+.status-dot.online {
+  background-color: #22c55e;
+}
+
+.status-dot.offline {
+  background-color: #94a3b8;
+}
+
+.status-text {
+  vertical-align: middle;
+}
+
+.last-seen {
+  margin-left: 0.25rem;
+  opacity: 0.7;
+  font-size: 0.85em;
+}
+
+.tag-values {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+}
+
+.device-tag-chip {
+  font-size: 0.7rem;
+  padding: 0.1rem 0.5rem;
+  border-radius: 0.75rem;
+  background-color: var(--primary-color-50, #eff6ff);
+  color: var(--primary-color-700, #1d4ed8);
+  border: 1px solid var(--primary-color-200, #bfdbfe);
+  white-space: nowrap;
+}
+
+.alias .detail-label::before {
+  background-color: #0ea5e9;
+  /* 青色 */
+}
+
+.status .detail-label::before {
+  background-color: #22c55e;
+  /* 绿色 */
+}
+
+.tags .detail-label::before {
+  background-color: #f97316;
+  /* 橙色 */
 }
 
 /* 机器ID特殊样式 */

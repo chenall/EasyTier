@@ -375,6 +375,18 @@ web:
     version: Version
     machine_id: Machine ID
     unknown_location: Unknown Location
+    filter_by_tag: Filter by Tag
+    all_tags: All Tags
+    sort_by_status: Status
+    edit: Edit
+    edit_alias_tags: Edit Alias & Tags
+    alias: Alias
+    tags: Tags
+    alias_placeholder: Enter device alias
+    tags_placeholder: Separate tags with commas
+    tags_hint: Separate multiple tags with commas, e.g. prod, beijing
+    save_success: Saved
+    save_failed: Save failed
     
   device_management:
     edit_network: Edit Network

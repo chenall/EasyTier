@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
-import { Button, Drawer, ProgressSpinner, useToast, InputSwitch, Popover, Dropdown, Toolbar } from 'primevue';
+import { Button, Drawer, ProgressSpinner, useToast, InputSwitch, Popover, Dropdown, Toolbar, MultiSelect, Dialog, InputText } from 'primevue';
 import Tooltip from 'primevue/tooltip';
 import { useRoute, useRouter } from 'vue-router';
 import { Utils } from 'easytier-frontend-lib';
@@ -123,7 +123,8 @@ const drawerHeight = computed(() => {
 const sortOptions = ref([
     { name: () => t('web.device.sort_by_hostname'), value: 'hostname', icon: 'pi pi-home' },
     { name: () => t('web.device.sort_by_version'), value: 'version', icon: 'pi pi-tag' },
-    { name: () => t('web.device.sort_by_networks'), value: 'networks', icon: 'pi pi-sitemap' }
+    { name: () => t('web.device.sort_by_networks'), value: 'networks', icon: 'pi pi-sitemap' },
+    { name: () => t('web.device.sort_by_status'), value: 'status', icon: 'pi pi-circle-fill' }
 ]);
 const selectedSortOption = ref(sortOptions.value[0]);
 // 排序方向 (true为升序，false为降序)
@@ -154,6 +155,9 @@ const sortDevices = (devices: Array<Utils.DeviceInfo> | undefined) => {
             case 'networks':
                 result = a.running_network_count - b.running_network_count;
                 break;
+        case 'status':
+                result = (a.online ? 0 : 1) - (b.online ? 0 : 1);
+                break;
         }
 
         return result * direction;
@@ -164,6 +168,51 @@ const sortDevices = (devices: Array<Utils.DeviceInfo> | undefined) => {
 const sortedDeviceList = computed(() => {
     return sortDevices(deviceList.value);
 });
+
+// 标签筛选：根据选中的标签过滤设备
+const availableTags = computed<Array<{ name: string; value: string }>>(() => {
+    const set = new Set<string>();
+    deviceList.value?.forEach((d) => (d.tags ?? []).forEach((t) => set.add(t)));
+    return Array.from(set).map((t) => ({ name: t, value: t }));
+});
+const selectedTags = ref<Array<string>>([]);
+
+const filteredDeviceList = computed<Array<Utils.DeviceInfo> | undefined>(() => {
+    const list = sortedDeviceList.value;
+    if (!list || selectedTags.value.length === 0) return list;
+    return list.filter((d) => (d.tags ?? []).some((t) => selectedTags.value.includes(t)));
+});
+
+// 编辑别名与标签
+const editDialogVisible = ref(false);
+const editingDevice = ref<Utils.DeviceInfo | null>(null);
+const editAlias = ref('');
+const editTagsText = ref('');
+
+const openEdit = (device: Utils.DeviceInfo) => {
+    editingDevice.value = device;
+    editAlias.value = device.alias ?? '';
+    editTagsText.value = (device.tags ?? []).join(', ');
+    editDialogVisible.value = true;
+};
+
+const saveEdit = async () => {
+    if (!editingDevice.value) return;
+    const mid = editingDevice.value.machine_id;
+    const tags = editTagsText.value
+        .split(',')
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0);
+    try {
+        await api?.set_machine_alias(mid, editAlias.value);
+        await api?.set_machine_tags(mid, tags);
+        editDialogVisible.value = false;
+        await loadDevices();
+        toast.add({ severity: 'success', summary: t('web.device.save_success'), life: 2000 });
+    } catch (e) {
+        toast.add({ severity: 'error', summary: t('web.device.save_failed'), detail: e, life: 2000 });
+    }
+};
 
 // 保存resize事件处理函数的引用，以便正确移除
 const handleResize = () => {
@@ -681,6 +730,48 @@ const handleResize = () => {
     margin: 0 0.1rem;
 }
 
+/* 在线/离线状态点 */
+.status-dot {
+    display: inline-block;
+    width: 0.55rem;
+    height: 0.55rem;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+
+.status-dot.online {
+    background-color: #22c55e;
+    box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.2);
+}
+
+.status-dot.offline {
+    background-color: #94a3b8;
+}
+
+/* 标签 chips */
+.device-tag-chip {
+    font-size: 0.7rem;
+    line-height: 1.2;
+    padding: 0.1rem 0.5rem;
+    border-radius: 0.75rem;
+    background-color: var(--primary-color-50, #eff6ff);
+    color: var(--primary-color-700, #1d4ed8);
+    border: 1px solid var(--primary-color-200, #bfdbfe);
+    white-space: nowrap;
+}
+
+@media (prefers-color-scheme: dark) {
+    .device-tag-chip {
+        background-color: rgba(59, 130, 246, 0.15);
+        color: #93c5fd;
+        border-color: rgba(59, 130, 246, 0.4);
+    }
+
+    .status-dot.offline {
+        background-color: #64748b;
+    }
+}
+
 @media (prefers-color-scheme: dark) {
     .location-text {
         color: var(--text-color-secondary, #cbd5e1);
@@ -723,6 +814,12 @@ const handleResize = () => {
                         v-tooltip.top="ascending ? t('web.device.sort_direction_asc') : t('web.device.sort_direction_desc')"
                         @click="toggleSortDirection" />
                 </div>
+                <div class="flex items-center gap-2 ml-2">
+                    <label class="text-sm text-500 hidden md:block">{{ t('web.device.filter_by_tag') }}：</label>
+                    <MultiSelect v-model="selectedTags" :options="availableTags" optionLabel="name"
+                        optionValue="value" :placeholder="t('web.device.all_tags')" display="chip"
+                        :maxSelectedLabels="3" class="!min-w-[140px] text-sm" />
+                </div>
             </template>
             <template #end>
                 <div class="flex items-center gap-3">
@@ -743,19 +840,23 @@ const handleResize = () => {
         <div v-if="deviceList !== undefined">
             <!-- 卡片视图 (适用于所有屏幕尺寸) -->
             <div class="card-container">
-                <div v-for="device in sortedDeviceList" :key="device.machine_id" class="device-card">
+                <div v-for="device in filteredDeviceList" :key="device.machine_id" class="device-card">
                     <!-- 卡片头部 -->
                     <div class="card-header">
                         <!-- 上部区域：设备名称和版本徽章 -->
                         <div class="flex justify-between items-center mb-2">
-                            <!-- 设备名称 -->
-                            <div class="font-semibold truncate card-title" :title="device.hostname">{{ device.hostname
-                            }}
+                            <!-- 设备名称（别名优先）与在线状态 -->
+                            <div class="flex items-center gap-2 min-w-0">
+                                <span class="status-dot" :class="device.online ? 'online' : 'offline'"
+                                    :title="device.online ? t('web.device.online') : t('web.device.offline')"></span>
+                                <div class="font-semibold truncate card-title"
+                                    :title="device.alias || device.hostname">{{ device.alias || device.hostname }}
+                                </div>
                             </div>
 
                             <!-- 版本徽章 -->
                             <div class="text-xs version-badge" v-tooltip="`EasyTier ${device.easytier_version}`">
-                                v{{ device.easytier_version.split('-')[0] }}
+                                v{{ (device.easytier_version || '').split('-')[0] }}
                             </div>
                         </div>
 
@@ -796,11 +897,20 @@ const handleResize = () => {
                                     severity="info" text rounded class="w-9 h-9" v-if="!showDetailedView"
                                     @click="showDeviceDetails(device, $event)" />
 
+                                <!-- 编辑别名/标签 -->
+                                <Button icon="pi pi-pencil" @click="openEdit(device)" severity="secondary" text
+                                    rounded class="w-9 h-9" :title="t('web.device.edit')" />
+
                                 <!-- 设置按钮 -->
                                 <Button icon="pi pi-cog" @click="handleDeviceManagement(device)" severity="secondary"
-                                    rounded class="w-9 h-9" :title="`Manage ${device.hostname}`" />
+                                    rounded class="w-9 h-9" :title="`Manage ${device.alias || device.hostname}`" />
                             </div>
                         </div>
+                    </div>
+
+                    <!-- 标签 chips -->
+                    <div v-if="(device.tags ?? []).length" class="flex flex-wrap gap-1 px-3 pb-2">
+                        <span v-for="tag in device.tags" :key="tag" class="device-tag-chip">{{ tag }}</span>
                     </div>
 
                     <!-- 详情区域 - 当开启详情显示时展示 -->
@@ -839,5 +949,28 @@ const handleResize = () => {
                 </div>
             </template>
         </Drawer>
+
+        <!-- 编辑别名与标签 -->
+        <Dialog v-model:visible="editDialogVisible" :header="t('web.device.edit_alias_tags')" modal
+            :draggable="false" class="w-[90%] max-w-[420px]">
+            <div class="flex flex-col gap-4">
+                <div class="flex flex-col gap-1">
+                    <label class="text-sm font-medium">{{ t('web.device.alias') }}</label>
+                    <InputText v-model="editAlias" :placeholder="t('web.device.alias_placeholder')" class="w-full" />
+                </div>
+                <div class="flex flex-col gap-1">
+                    <label class="text-sm font-medium">{{ t('web.device.tags') }}</label>
+                    <InputText v-model="editTagsText" :placeholder="t('web.device.tags_placeholder')" class="w-full" />
+                    <small class="text-500">{{ t('web.device.tags_hint') }}</small>
+                </div>
+            </div>
+            <template #footer>
+                <div class="flex justify-end gap-2">
+                    <Button :label="t('web.common.cancel')" severity="secondary" text
+                        @click="editDialogVisible = false" />
+                    <Button :label="t('web.common.save')" @click="saveEdit" />
+                </div>
+            </template>
+        </Dialog>
     </div>
 </template>

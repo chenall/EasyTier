@@ -3,6 +3,14 @@ use std::sync::{Arc, Weak};
 use dashmap::DashMap;
 
 use crate::db::{Db, UserIdInDb};
+use crate::db::entity::device_info as di;
+use crate::db::entity::device_tags as dt;
+
+use sea_orm::{
+    ColumnTrait, DbErr, EntityTrait, QueryFilter, Set, TransactionTrait,
+};
+use sea_orm::prelude::Expr;
+use sea_orm::sea_query::OnConflict;
 
 // use this to maintain Storage
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -210,6 +218,127 @@ impl Storage {
         tracing::info!("Auto-created user '{}' with id {}", username, new_user.id);
         Ok(new_user.id)
     }
+
+    pub async fn upsert_device_info(
+        &self,
+        user_id: UserIdInDb,
+        machine_id: uuid::Uuid,
+        hostname: &str,
+        easytier_version: &str,
+        device_os_type: &str,
+        device_os_version: &str,
+        device_os_distribution: &str,
+    ) -> Result<(), DbErr> {
+        let now = chrono::Local::now().fixed_offset();
+        let on_conflict = OnConflict::columns([di::Column::UserId, di::Column::MachineId])
+            .update_columns([
+                di::Column::Hostname,
+                di::Column::EasytierVersion,
+                di::Column::DeviceOsType,
+                di::Column::DeviceOsVersion,
+                di::Column::DeviceOsDistribution,
+                di::Column::LastSeenAt,
+                di::Column::UpdatedAt,
+            ])
+            .to_owned();
+        let insert_m = di::ActiveModel {
+            user_id: Set(user_id),
+            machine_id: Set(machine_id.to_string()),
+            hostname: Set(hostname.to_string()),
+            easytier_version: Set(easytier_version.to_string()),
+            device_os_type: Set(device_os_type.to_string()),
+            device_os_version: Set(device_os_version.to_string()),
+            device_os_distribution: Set(device_os_distribution.to_string()),
+            alias: Set(String::new()),
+            last_seen_at: Set(now.to_rfc3339()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        };
+
+        // ON CONFLICT (user_id, machine_id) DO UPDATE — refresh heartbeat-derived
+        // fields on every call so offline detection (last_seen_at) stays accurate.
+        // NOTE: do NOT chain `.do_nothing()` here; that would downgrade this to
+        // insert-or-ignore and last_seen_at would never refresh.
+        di::Entity::insert(insert_m)
+            .on_conflict(on_conflict)
+            .exec(self.db().orm_db())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_device_infos_by_user(
+        &self,
+        user_id: UserIdInDb,
+    ) -> Result<Vec<di::Model>, DbErr> {
+        di::Entity::find()
+            .filter(di::Column::UserId.eq(user_id))
+            .all(self.db().orm_db())
+            .await
+    }
+
+    pub async fn set_device_alias(
+        &self,
+        user_id: UserIdInDb,
+        machine_id: uuid::Uuid,
+        alias: &str,
+    ) -> Result<(), DbErr> {
+        let now = chrono::Local::now().fixed_offset();
+        di::Entity::update_many()
+            .filter(di::Column::UserId.eq(user_id))
+            .filter(di::Column::MachineId.eq(machine_id.to_string()))
+            .col_expr(di::Column::Alias, Expr::value(alias.to_string()))
+            .col_expr(di::Column::UpdatedAt, Expr::value(now))
+            .exec(self.db().orm_db())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_device_tags(
+        &self,
+        user_id: UserIdInDb,
+        machine_id: uuid::Uuid,
+    ) -> Result<Vec<String>, DbErr> {
+        let rows = dt::Entity::find()
+            .filter(dt::Column::UserId.eq(user_id))
+            .filter(dt::Column::MachineId.eq(machine_id.to_string()))
+            .all(self.db().orm_db())
+            .await?;
+        Ok(rows.into_iter().map(|r| r.tag).collect())
+    }
+
+    pub async fn replace_device_tags(
+        &self,
+        user_id: UserIdInDb,
+        machine_id: uuid::Uuid,
+        tags: &[String],
+    ) -> Result<(), DbErr> {
+        let orm = self.db().orm_db();
+        let txn = orm.begin().await?;
+
+        dt::Entity::delete_many()
+            .filter(dt::Column::UserId.eq(user_id))
+            .filter(dt::Column::MachineId.eq(machine_id.to_string()))
+            .exec(&txn)
+            .await?;
+
+        let mut seen = std::collections::HashSet::new();
+        for tag in tags {
+            let t = tag.trim().to_string();
+            if t.is_empty() || !seen.insert(t.clone()) {
+                continue;
+            }
+            let insert_m = dt::ActiveModel {
+                user_id: Set(user_id),
+                machine_id: Set(machine_id.to_string()),
+                tag: Set(t),
+                ..Default::default()
+            };
+            dt::Entity::insert(insert_m).exec(&txn).await?;
+        }
+
+        txn.commit().await
+    }
 }
 
 #[cfg(test)]
@@ -386,5 +515,112 @@ mod tests {
             storage.get_client_url_by_machine_id(1, &machine_id),
             Some(authorized_token.client_url)
         );
+    }
+
+    #[tokio::test]
+    async fn upsert_device_info_inserts_then_refreshes_on_repeat() {
+        let storage = Storage::new(Db::memory_db().await);
+        let user = 1;
+        let mid = uuid::Uuid::new_v4();
+
+        storage
+            .upsert_device_info(user, mid, "host-a", "v1", "linux", "6.0", "ubuntu")
+            .await
+            .unwrap();
+
+        let rows = storage.list_device_infos_by_user(user).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].hostname, "host-a");
+        assert_eq!(rows[0].alias, "", "new device must default to empty alias");
+        assert_eq!(rows[0].machine_id, mid.to_string());
+        assert_eq!(rows[0].easytier_version, "v1");
+
+        // Repeat with changed heartbeat fields — must update in place, not insert a 2nd row.
+        storage
+            .upsert_device_info(user, mid, "host-b", "v2", "linux", "6.1", "debian")
+            .await
+            .unwrap();
+
+        let rows = storage.list_device_infos_by_user(user).await.unwrap();
+        assert_eq!(rows.len(), 1, "upsert must not create a duplicate row");
+        assert_eq!(rows[0].hostname, "host-b", "heartbeat fields must refresh");
+        assert_eq!(rows[0].alias, "", "user-set alias must survive upsert");
+        assert_eq!(rows[0].easytier_version, "v2");
+    }
+
+    #[tokio::test]
+    async fn list_device_infos_by_user_is_scoped_per_user() {
+        let storage = Storage::new(Db::memory_db().await);
+        let mid = uuid::Uuid::new_v4();
+
+        storage
+            .upsert_device_info(1, mid, "shared-mid", "v1", "", "", "")
+            .await
+            .unwrap();
+        storage
+            .upsert_device_info(2, mid, "shared-mid", "v1", "", "", "")
+            .await
+            .unwrap();
+
+        let u1 = storage.list_device_infos_by_user(1).await.unwrap();
+        let u2 = storage.list_device_infos_by_user(2).await.unwrap();
+        assert_eq!(u1.len(), 1, "user 1 sees exactly its own device");
+        assert_eq!(u2.len(), 1, "user 2 sees exactly its own device");
+        assert_eq!(u1[0].machine_id, mid.to_string());
+        assert_eq!(u2[0].machine_id, mid.to_string());
+    }
+
+    #[tokio::test]
+    async fn set_device_alias_persists_and_survives_later_upsert() {
+        let storage = Storage::new(Db::memory_db().await);
+        let mid = uuid::Uuid::new_v4();
+        storage
+            .upsert_device_info(1, mid, "host", "v1", "", "", "")
+            .await
+            .unwrap();
+
+        storage.set_device_alias(1, mid, "My-PC").await.unwrap();
+        let rows = storage.list_device_infos_by_user(1).await.unwrap();
+        assert_eq!(rows[0].alias, "My-PC");
+
+        // A later heartbeat must keep the user-set alias while refreshing other fields.
+        storage
+            .upsert_device_info(1, mid, "host-new", "v2", "", "", "")
+            .await
+            .unwrap();
+        let rows = storage.list_device_infos_by_user(1).await.unwrap();
+        assert_eq!(rows[0].alias, "My-PC", "alias must survive upsert");
+        assert_eq!(rows[0].hostname, "host-new", "hostname must still refresh");
+    }
+
+    #[tokio::test]
+    async fn replace_device_tags_dedups_and_overwrites_previous_set() {
+        let storage = Storage::new(Db::memory_db().await);
+        let mid = uuid::Uuid::new_v4();
+        storage
+            .upsert_device_info(1, mid, "host", "v1", "", "", "")
+            .await
+            .unwrap();
+
+        // First set: includes a duplicate and an empty entry that must be dropped.
+        storage
+            .replace_device_tags(
+                1,
+                mid,
+                &["prod".into(), "prod".into(), "".into(), "edge".into()],
+            )
+            .await
+            .unwrap();
+        let mut tags = storage.list_device_tags(1, mid).await.unwrap();
+        tags.sort();
+        assert_eq!(tags, vec!["edge".to_string(), "prod".to_string()]);
+
+        // Second set fully replaces the first (not appended).
+        storage
+            .replace_device_tags(1, mid, &["staging".into()])
+            .await
+            .unwrap();
+        let tags = storage.list_device_tags(1, mid).await.unwrap();
+        assert_eq!(tags, vec!["staging".to_string()]);
     }
 }

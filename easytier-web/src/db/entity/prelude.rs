@@ -8,3 +8,5 @@ pub use super::tower_sessions::Entity as TowerSessions;
 pub use super::user_running_network_configs::Entity as UserRunningNetworkConfigs;
 pub use super::users::Entity as Users;
 pub use super::users_groups::Entity as UsersGroups;
+pub use super::device_info::Entity as DeviceInfo;
+pub use super::device_tags::Entity as DeviceTags;

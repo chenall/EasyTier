@@ -115,11 +115,36 @@ struct ListMachineItem {
     client_url: Option<url::Url>,
     info: Option<HeartbeatRequest>,
     location: Option<Location>,
+    alias: String,
+    online: bool,
+    last_seen_at: String,
+    tags: Vec<String>,
+    // Registry-sourced identity/last-known fields. Carried explicitly (not only
+    // via `info`) so OFFLINE devices — where `info` is None — still have a stable
+    // machine_id, hostname and version to display and to key/edit on.
+    machine_id: String,
+    hostname: String,
+    easytier_version: String,
 }
 
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 struct ListMachineJsonResp {
     machines: Vec<ListMachineItem>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SetAliasJsonReq {
+    alias: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SetTagsJsonReq {
+    tags: Vec<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct TagsJsonResp {
+    tags: Vec<String>,
 }
 
 pub struct NetworkApi;
@@ -275,21 +300,126 @@ impl NetworkApi {
     ) -> Result<Json<ListMachineJsonResp>, HttpHandleError> {
         let user_id = Self::get_user_id(&auth_session)?;
 
+        // 1. Collect live machines (client url + heartbeat + location) keyed by machine id.
         let client_urls = client_mgr.list_machine_by_user_id(user_id).await;
+        let mut live: std::collections::HashMap<
+            String,
+            (url::Url, HeartbeatRequest, Option<Location>),
+        > = std::collections::HashMap::new();
+        for client_url in client_urls.iter() {
+            let session = client_mgr.get_heartbeat_requests(client_url).await;
+            let location = client_mgr.get_machine_location(client_url).await;
+            if let Some(hb) = session
+                && let Some(mid) = hb.machine_id
+            {
+                let mid_str = mid.to_string();
+                live.insert(mid_str, (client_url.clone(), hb, location));
+            }
+        }
+
+        // 2. Persist live machines into the device registry.
+        for (mid_str, (_, hb, _)) in live.iter() {
+            let mid: uuid::Uuid = mid_str.parse().map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    other_error("Invalid machine id".to_string()).into(),
+                )
+            })?;
+            let os = hb.device_os.as_ref();
+            client_mgr
+                .upsert_device_info(
+                    user_id,
+                    mid,
+                    &hb.hostname,
+                    &hb.easytier_version,
+                    os.map(|d| d.os_type.as_str()).unwrap_or(""),
+                    os.map(|d| d.version.as_str()).unwrap_or(""),
+                    os.map(|d| d.distribution.as_str()).unwrap_or(""),
+                )
+                .await
+                .map_err(convert_error)?;
+        }
+
+        // 3. Load the full registry (online + offline) and enrich each entry.
+        let devices = client_mgr
+            .list_device_infos_by_user(user_id)
+            .await
+            .map_err(convert_error)?;
 
         let mut machines = vec![];
-        for item in client_urls.iter() {
-            let client_url = item.clone();
-            let session = client_mgr.get_heartbeat_requests(&client_url).await;
-            let location = client_mgr.get_machine_location(&client_url).await;
+        for dev in devices {
+            let mid_str = dev.machine_id.clone();
+            let is_online = live.contains_key(&mid_str);
+            let mid_uuid = uuid::Uuid::parse_str(&mid_str).unwrap_or_default();
+
+            let tags = client_mgr
+                .list_device_tags(user_id, mid_uuid)
+                .await
+                .map_err(convert_error)?;
+
+            let (client_url, info, location) = if is_online {
+                let (url, hb, loc) = live.remove(&mid_str).unwrap();
+                (Some(url), Some(hb), loc)
+            } else {
+                (None, None, None)
+            };
+
             machines.push(ListMachineItem {
-                client_url: Some(client_url),
-                info: session,
+                client_url,
+                info,
                 location,
+                alias: dev.alias,
+                online: is_online,
+                last_seen_at: dev.last_seen_at,
+                tags,
+                machine_id: dev.machine_id.clone(),
+                hostname: dev.hostname.clone(),
+                easytier_version: dev.easytier_version.clone(),
             });
         }
 
         Ok(Json(ListMachineJsonResp { machines }))
+    }
+
+    async fn handle_set_machine_alias(
+        auth_session: AuthSession,
+        State(client_mgr): AppState,
+        Path(machine_id): Path<uuid::Uuid>,
+        Json(payload): Json<SetAliasJsonReq>,
+    ) -> Result<Json<Void>, HttpHandleError> {
+        let user_id = Self::get_user_id(&auth_session)?;
+        client_mgr
+            .set_device_alias(user_id, machine_id, &payload.alias)
+            .await
+            .map_err(convert_error)?;
+        Ok(Void::default().into())
+    }
+
+    async fn handle_get_machine_tags(
+        auth_session: AuthSession,
+        State(client_mgr): AppState,
+        Path(machine_id): Path<uuid::Uuid>,
+    ) -> Result<Json<TagsJsonResp>, HttpHandleError> {
+        let user_id = Self::get_user_id(&auth_session)?;
+        let tags = client_mgr
+            .list_device_tags(user_id, machine_id)
+            .await
+            .map_err(convert_error)?;
+        Ok(Json(TagsJsonResp { tags }))
+    }
+
+    async fn handle_set_machine_tags(
+        auth_session: AuthSession,
+        State(client_mgr): AppState,
+        Path(machine_id): Path<uuid::Uuid>,
+        Json(payload): Json<SetTagsJsonReq>,
+    ) -> Result<Json<Void>, HttpHandleError> {
+        let user_id = Self::get_user_id(&auth_session)?;
+        client_mgr
+            .replace_device_tags(user_id, machine_id, &payload.tags)
+            .await
+            .map_err(convert_error)?;
+        Ok(Void::default().into())
     }
 
     async fn handle_update_network_state(
@@ -525,6 +655,14 @@ impl NetworkApi {
     pub fn build_route() -> Router<AppStateInner> {
         Router::new()
             .route("/api/v1/machines", get(Self::handle_list_machines))
+            .route(
+                "/api/v1/machines/:machine-id/alias",
+                put(Self::handle_set_machine_alias),
+            )
+            .route(
+                "/api/v1/machines/:machine-id/tags",
+                get(Self::handle_get_machine_tags).put(Self::handle_set_machine_tags),
+            )
             .route(
                 "/api/v1/machines/:machine-id/validate-config",
                 post(Self::handle_validate_config),

@@ -375,6 +375,18 @@ web:
     version: 版本
     machine_id: 机器ID
     unknown_location: 未知位置
+    filter_by_tag: 按标签筛选
+    all_tags: 全部标签
+    sort_by_status: 状态
+    edit: 编辑
+    edit_alias_tags: 编辑别名与标签
+    alias: 别名
+    tags: 标签
+    alias_placeholder: 输入设备别名
+    tags_placeholder: 多个标签用逗号分隔
+    tags_hint: 多个标签请用英文逗号分隔，例如：生产环境, 北京
+    save_success: 已保存
+    save_failed: 保存失败
 
   device_management:
     edit_network: 编辑网络

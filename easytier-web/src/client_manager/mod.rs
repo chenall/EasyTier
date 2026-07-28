@@ -319,6 +319,78 @@ impl ClientManager {
         s.data().read().await.location().cloned()
     }
 
+    pub async fn upsert_device_info(
+        &self,
+        user_id: UserIdInDb,
+        machine_id: uuid::Uuid,
+        hostname: &str,
+        easytier_version: &str,
+        device_os_type: &str,
+        device_os_version: &str,
+        device_os_distribution: &str,
+    ) -> Result<(), remote_client::RemoteClientError<sea_orm::DbErr>> {
+        self.storage
+            .upsert_device_info(
+                user_id,
+                machine_id,
+                hostname,
+                easytier_version,
+                device_os_type,
+                device_os_version,
+                device_os_distribution,
+            )
+            .await
+            .map_err(remote_client::RemoteClientError::PersistentError)
+    }
+
+    pub async fn list_device_infos_by_user(
+        &self,
+        user_id: UserIdInDb,
+    ) -> Result<
+        Vec<crate::db::entity::device_info::Model>,
+        remote_client::RemoteClientError<sea_orm::DbErr>,
+    > {
+        self.storage
+            .list_device_infos_by_user(user_id)
+            .await
+            .map_err(remote_client::RemoteClientError::PersistentError)
+    }
+
+    pub async fn set_device_alias(
+        &self,
+        user_id: UserIdInDb,
+        machine_id: uuid::Uuid,
+        alias: &str,
+    ) -> Result<(), remote_client::RemoteClientError<sea_orm::DbErr>> {
+        self.storage
+            .set_device_alias(user_id, machine_id, alias)
+            .await
+            .map_err(remote_client::RemoteClientError::PersistentError)
+    }
+
+    pub async fn list_device_tags(
+        &self,
+        user_id: UserIdInDb,
+        machine_id: uuid::Uuid,
+    ) -> Result<Vec<String>, remote_client::RemoteClientError<sea_orm::DbErr>> {
+        self.storage
+            .list_device_tags(user_id, machine_id)
+            .await
+            .map_err(remote_client::RemoteClientError::PersistentError)
+    }
+
+    pub async fn replace_device_tags(
+        &self,
+        user_id: UserIdInDb,
+        machine_id: uuid::Uuid,
+        tags: &[String],
+    ) -> Result<(), remote_client::RemoteClientError<sea_orm::DbErr>> {
+        self.storage
+            .replace_device_tags(user_id, machine_id, tags)
+            .await
+            .map_err(remote_client::RemoteClientError::PersistentError)
+    }
+
     fn db(&self) -> &Db {
         self.storage.db()
     }
