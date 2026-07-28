@@ -340,9 +340,14 @@ impl NetworkApi {
                 .map_err(convert_error)?;
         }
 
-        // 3. Load the full registry (online + offline) and enrich each entry.
+        // 3. Load the full registry (online + offline) plus all tags for the
+        //    user in a single query (avoids one SELECT per device — N+1).
         let devices = client_mgr
             .list_device_infos_by_user(user_id)
+            .await
+            .map_err(convert_error)?;
+        let tags_by_machine = client_mgr
+            .list_device_tags_by_user(user_id)
             .await
             .map_err(convert_error)?;
 
@@ -350,12 +355,11 @@ impl NetworkApi {
         for dev in devices {
             let mid_str = dev.machine_id.clone();
             let is_online = live.contains_key(&mid_str);
-            let mid_uuid = uuid::Uuid::parse_str(&mid_str).unwrap_or_default();
 
-            let tags = client_mgr
-                .list_device_tags(user_id, mid_uuid)
-                .await
-                .map_err(convert_error)?;
+            let tags = tags_by_machine
+                .get(&mid_str)
+                .cloned()
+                .unwrap_or_default();
 
             let (client_url, info, location) = if is_online {
                 let (url, hb, loc) = live.remove(&mid_str).unwrap();
@@ -388,6 +392,17 @@ impl NetworkApi {
         Json(payload): Json<SetAliasJsonReq>,
     ) -> Result<Json<Void>, HttpHandleError> {
         let user_id = Self::get_user_id(&auth_session)?;
+        if client_mgr
+            .get_device_info(user_id, machine_id)
+            .await
+            .map_err(convert_error)?
+            .is_none()
+        {
+            return Err((
+                StatusCode::NOT_FOUND,
+                other_error("Device not found".to_string()).into(),
+            ));
+        }
         client_mgr
             .set_device_alias(user_id, machine_id, &payload.alias)
             .await
@@ -415,6 +430,17 @@ impl NetworkApi {
         Json(payload): Json<SetTagsJsonReq>,
     ) -> Result<Json<Void>, HttpHandleError> {
         let user_id = Self::get_user_id(&auth_session)?;
+        if client_mgr
+            .get_device_info(user_id, machine_id)
+            .await
+            .map_err(convert_error)?
+            .is_none()
+        {
+            return Err((
+                StatusCode::NOT_FOUND,
+                other_error("Device not found".to_string()).into(),
+            ));
+        }
         client_mgr
             .replace_device_tags(user_id, machine_id, &payload.tags)
             .await

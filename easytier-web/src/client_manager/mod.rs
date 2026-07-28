@@ -356,6 +356,20 @@ impl ClientManager {
             .map_err(remote_client::RemoteClientError::PersistentError)
     }
 
+    pub async fn get_device_info(
+        &self,
+        user_id: UserIdInDb,
+        machine_id: uuid::Uuid,
+    ) -> Result<
+        Option<crate::db::entity::device_info::Model>,
+        remote_client::RemoteClientError<sea_orm::DbErr>,
+    > {
+        self.storage
+            .get_device_info(user_id, machine_id)
+            .await
+            .map_err(remote_client::RemoteClientError::PersistentError)
+    }
+
     pub async fn set_device_alias(
         &self,
         user_id: UserIdInDb,
@@ -375,6 +389,19 @@ impl ClientManager {
     ) -> Result<Vec<String>, remote_client::RemoteClientError<sea_orm::DbErr>> {
         self.storage
             .list_device_tags(user_id, machine_id)
+            .await
+            .map_err(remote_client::RemoteClientError::PersistentError)
+    }
+
+    pub async fn list_device_tags_by_user(
+        &self,
+        user_id: UserIdInDb,
+    ) -> Result<
+        std::collections::HashMap<String, Vec<String>>,
+        remote_client::RemoteClientError<sea_orm::DbErr>,
+    > {
+        self.storage
+            .list_device_tags_by_user(user_id)
             .await
             .map_err(remote_client::RemoteClientError::PersistentError)
     }

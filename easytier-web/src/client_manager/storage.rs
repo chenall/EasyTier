@@ -47,6 +47,10 @@ impl TryFrom<WeakRefStorage> for Storage {
     }
 }
 
+/// Minimum gap (seconds) between last_seen refreshes so that a frequently
+/// polled machine list does not write to the DB on every request.
+const DEVICE_INFO_REFRESH_INTERVAL_SEC: i64 = 30;
+
 impl Storage {
     pub fn new(db: Db) -> Self {
         Storage(Arc::new(StorageInner {
@@ -230,6 +234,31 @@ impl Storage {
         device_os_distribution: &str,
     ) -> Result<(), DbErr> {
         let now = chrono::Local::now().fixed_offset();
+        let now_ts = now.timestamp();
+
+        // Write-on-read guard: GET /api/v1/machines polls frequently. Skip the
+        // upsert when the device is already registered and its heartbeat-derived
+        // fields are unchanged AND were persisted recently. This avoids a DB
+        // write on every poll (the common steady-state case) while still
+        // refreshing last_seen/identity whenever something actually changes.
+        if let Some(existing) = di::Entity::find()
+            .filter(di::Column::UserId.eq(user_id))
+            .filter(di::Column::MachineId.eq(machine_id.to_string()))
+            .one(self.db().orm_db())
+            .await?
+        {
+            let unchanged = existing.hostname == hostname
+                && existing.easytier_version == easytier_version
+                && existing.device_os_type == device_os_type
+                && existing.device_os_version == device_os_version
+                && existing.device_os_distribution == device_os_distribution;
+            let recent = chrono::DateTime::parse_from_rfc3339(&existing.last_seen_at)
+                .map(|t| now_ts - t.timestamp() < DEVICE_INFO_REFRESH_INTERVAL_SEC)
+                .unwrap_or(false);
+            if unchanged && recent {
+                return Ok(());
+            }
+        }
         let on_conflict = OnConflict::columns([di::Column::UserId, di::Column::MachineId])
             .update_columns([
                 di::Column::Hostname,
@@ -277,6 +306,18 @@ impl Storage {
             .await
     }
 
+    pub async fn get_device_info(
+        &self,
+        user_id: UserIdInDb,
+        machine_id: uuid::Uuid,
+    ) -> Result<Option<di::Model>, DbErr> {
+        di::Entity::find()
+            .filter(di::Column::UserId.eq(user_id))
+            .filter(di::Column::MachineId.eq(machine_id.to_string()))
+            .one(self.db().orm_db())
+            .await
+    }
+
     pub async fn set_device_alias(
         &self,
         user_id: UserIdInDb,
@@ -305,6 +346,21 @@ impl Storage {
             .all(self.db().orm_db())
             .await?;
         Ok(rows.into_iter().map(|r| r.tag).collect())
+    }
+
+    pub async fn list_device_tags_by_user(
+        &self,
+        user_id: UserIdInDb,
+    ) -> Result<std::collections::HashMap<String, Vec<String>>, DbErr> {
+        let rows = dt::Entity::find()
+            .filter(dt::Column::UserId.eq(user_id))
+            .all(self.db().orm_db())
+            .await?;
+        let mut map = std::collections::HashMap::new();
+        for r in rows {
+            map.entry(r.machine_id).or_insert_with(Vec::new).push(r.tag);
+        }
+        Ok(map)
     }
 
     pub async fn replace_device_tags(
@@ -622,5 +678,55 @@ mod tests {
             .unwrap();
         let tags = storage.list_device_tags(1, mid).await.unwrap();
         assert_eq!(tags, vec!["staging".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn get_device_info_returns_none_before_upsert_and_some_after() {
+        let storage = Storage::new(Db::memory_db().await);
+        let mid = uuid::Uuid::new_v4();
+        assert!(
+            storage.get_device_info(1, mid).await.unwrap().is_none(),
+            "unknown device must not be found"
+        );
+        storage
+            .upsert_device_info(1, mid, "host", "v1", "", "", "")
+            .await
+            .unwrap();
+        let dev = storage.get_device_info(1, mid).await.unwrap();
+        assert!(dev.is_some());
+        assert_eq!(dev.unwrap().machine_id, mid.to_string());
+    }
+
+    #[tokio::test]
+    async fn list_device_tags_by_user_groups_tags_per_machine() {
+        let storage = Storage::new(Db::memory_db().await);
+        let a = uuid::Uuid::new_v4();
+        let b = uuid::Uuid::new_v4();
+        storage
+            .upsert_device_info(1, a, "host-a", "v1", "", "", "")
+            .await
+            .unwrap();
+        storage
+            .upsert_device_info(1, b, "host-b", "v1", "", "", "")
+            .await
+            .unwrap();
+
+        storage
+            .replace_device_tags(1, a, &["prod".into(), "edge".into()])
+            .await
+            .unwrap();
+        storage
+            .replace_device_tags(1, b, &["staging".into()])
+            .await
+            .unwrap();
+
+        let grouped = storage.list_device_tags_by_user(1).await.unwrap();
+        let mut a_tags = grouped.get(&a.to_string()).cloned().unwrap_or_default();
+        a_tags.sort();
+        assert_eq!(a_tags, vec!["edge".to_string(), "prod".to_string()]);
+        assert_eq!(
+            grouped.get(&b.to_string()).cloned().unwrap(),
+            vec!["staging".to_string()]
+        );
     }
 }
