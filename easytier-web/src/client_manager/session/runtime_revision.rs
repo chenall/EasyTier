@@ -2,13 +2,14 @@ use std::collections::{HashMap, HashSet};
 
 use easytier::proto::{
     api::manage::{
-        DeleteNetworkInstanceRequest, DeleteNetworkInstanceResponse,
+        DeleteNetworkInstanceRequest, DeleteNetworkInstanceResponse, GetNetworkInstanceConfigRequest,
         ListNetworkInstanceMetaRequest, ListNetworkInstanceRequest, NetworkConfig, NetworkMeta,
         RunNetworkInstanceRequest,
     },
     rpc_types::controller::BaseController,
     web::HeartbeatRequest,
 };
+use easytier_core::management::config_source_from_rpc;
 use easytier_core::management::remote_client::{ListNetworkProps, Storage as _};
 use tokio::sync::{RwLock, broadcast};
 
@@ -566,6 +567,19 @@ async fn sync_running_sources_for_round(
                     }
                 };
             }
+            // Mirror newly-discovered device-owned networks into the DB so they can
+            // be surfaced (and taken over) while the device is offline. Best-effort:
+            // a failure here must not abort the whole reconcile round.
+            if let Err(e) = seed_running_device_networks(&storage.db, rpc_client, round, &metas)
+                .await
+            {
+                tracing::warn!(
+                    user_id = ?round.user_id,
+                    machine_id = ?round.machine_id,
+                    %e,
+                    "Failed to seed running device networks into the DB"
+                );
+            }
             RoundStatus::Ready(Some(metas))
         }
         Err(e) => {
@@ -577,6 +591,90 @@ async fn sync_running_sources_for_round(
             RoundStatus::Ready(None)
         }
     }
+}
+
+/// Mirrors device-reported running networks that are not yet tracked by the web
+/// console into `user_running_network_configs`. This is what makes offline
+/// takeover possible: once a network's desired-state row exists in the DB, the
+/// offline list can surface it and the console can take it over (re-source to
+/// `web`) on edit/toggle.
+///
+/// Only networks absent from `round.local_configs` are seeded — every known row
+/// is handled by the existing source-sync path. For each new network the full
+/// config is fetched from the device via `get_network_instance_config`; the
+/// guarded upsert refuses to overwrite any existing `web` row.
+async fn seed_running_device_networks(
+    db: &crate::db::Db,
+    rpc_client: &mut SessionRpcClient,
+    round: &ReconcileRound,
+    metas: &[NetworkMeta],
+) -> anyhow::Result<()> {
+    if metas.is_empty() {
+        return Ok(());
+    }
+    let existing_ids: HashSet<String> = round
+        .local_configs
+        .iter()
+        .map(|c| c.network_instance_id.clone())
+        .collect();
+
+    for meta in metas {
+        let Some(inst_id): Option<uuid::Uuid> = meta.inst_id.as_ref().map(|i| (*i).into()) else {
+            continue;
+        };
+        let inst_id_str = inst_id.to_string();
+        if existing_ids.contains(&inst_id_str) {
+            // Already tracked; the source-sync path handles it.
+            continue;
+        }
+        let Some(running_source) = config_source_from_rpc(meta.source) else {
+            continue;
+        };
+
+        let resp = match rpc_client
+            .get_network_instance_config(
+                BaseController::default(),
+                GetNetworkInstanceConfigRequest {
+                    inst_id: Some(inst_id.into()),
+                },
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    instance_id = ?inst_id,
+                    %e,
+                    "Failed to fetch device network config while seeding"
+                );
+                continue;
+            }
+        };
+        let Some(config) = resp.config else {
+            tracing::warn!(
+                instance_id = ?inst_id,
+                "Device reported a running network with no config while seeding"
+            );
+            continue;
+        };
+
+        if !db
+            .upsert_network_config_guarded(
+                (round.user_id, round.machine_id),
+                inst_id,
+                config,
+                running_source,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to persist seeded network {inst_id_str}: {e}"))?
+        {
+            tracing::debug!(
+                instance_id = ?inst_id,
+                "Seeding skipped an existing web-owned row (guard held)"
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn cleanup_stale_web_source_instances(

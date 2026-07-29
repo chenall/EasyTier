@@ -7,7 +7,15 @@ export interface ValidateConfigResponse {
 
 export interface ListNetworkInstanceIdResponse {
     running_inst_ids: Array<UUID>,
+    // Enabled desired-state configs that are NOT currently running. When the
+    // device is offline these are the configs that will be pushed on the next
+    // reconnect ("pending on reconnect").
+    enabled_inst_ids: Array<UUID>,
     disabled_inst_ids: Array<UUID>,
+    // Device-owned (source != 'web') desired-state configs. The console can take
+    // these over while the device is offline; the UI surfaces them with a
+    // "pending takeover" affordance.
+    user_inst_ids: Array<UUID>,
 }
 
 export interface GenerateConfigResponse {

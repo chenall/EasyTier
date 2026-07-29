@@ -276,6 +276,8 @@ run_network: 运行网络
 stop_network: 停止网络
 network_running: 运行中
 network_stopped: 已停止
+network_pending: 待上线下发
+network_pending_takeover: 待接管
 dhcp_experimental_warning: 实验性警告！使用DHCP时如果组网环境中发生IP冲突，将自动更改IP。
 
 tray:
@@ -410,6 +412,7 @@ web:
     no_network_selected: 未选择网络
     select_existing_network_or_create_new: 选择现有网络实例或创建新网络以管理网络设置
     disable_network: 禁用网络
+    offline_network_hint: 设备当前离线，网络变更将在设备下次上线后自动下发
 
   network:
     title: 网络

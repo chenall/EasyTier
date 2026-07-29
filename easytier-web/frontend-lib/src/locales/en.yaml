@@ -276,6 +276,8 @@ run_network: Run Network
 stop_network: Stop Network
 network_running: running
 network_stopped: stopped
+network_pending: pending sync
+network_pending_takeover: pending takeover
 dhcp_experimental_warning: Experimental warning! if there is an IP conflict in the network when using DHCP, the IP will be automatically changed.
 
 tray:
@@ -410,6 +412,7 @@ web:
     no_network_selected: No Network Selected
     select_existing_network_or_create_new: Select an existing network instance or create a new one to manage network settings
     disable_network: Disable Network
+    offline_network_hint: The device is currently offline. Network changes will be pushed automatically when it comes back online.
 
   network:
     title: Network

@@ -589,6 +589,106 @@ impl Db {
         })
     }
 
+    /// Upsert a network config row with explicit control over the `disabled`
+    /// flag. Used by the offline-aware handlers so a config can be persisted as
+    /// desired state (enabled => pushed on next device reconnect) without a
+    /// live RPC client.
+    ///
+    /// When `source` is `Web`, the DO UPDATE is guarded by
+    /// `WHERE source = 'web'` so we never clobber a device-owned (user) row.
+    /// Returns `false` when the guard prevented the write.
+    pub async fn upsert_network_config(
+        &self,
+        (user_id, device_id): (UserIdInDb, Uuid),
+        network_inst_id: Uuid,
+        network_config: NetworkConfig,
+        source: ConfigSource,
+        disabled: bool,
+    ) -> Result<bool, DbErr> {
+        let now = chrono::Local::now().fixed_offset();
+        let network_config =
+            serde_json::to_string(&network_config).map_err(|e| DbErr::Json(e.to_string()))?;
+        let source_str = source.as_str();
+        // Web is authoritative: an offline save/run overwrites the desired-state
+        // row regardless of its current source, re-sourcing it to `source`. This
+        // is what lets the console take over a device-owned (user-sourced) network
+        // while the device is offline — on reconnect reconcile pushes the web
+        // version. There is deliberately no `WHERE source = ...` guard here.
+        let sql = r#"
+            INSERT INTO user_running_network_configs (
+                user_id, device_id, network_instance_id, network_config,
+                source, disabled, create_time, update_time
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, device_id, network_instance_id) DO UPDATE SET
+                network_config = excluded.network_config,
+                source = excluded.source,
+                disabled = excluded.disabled,
+                update_time = excluded.update_time
+        "#;
+        let result = sqlx::query(sql)
+            .bind(user_id)
+            .bind(device_id.to_string())
+            .bind(network_inst_id.to_string())
+            .bind(network_config)
+            .bind(source_str)
+            .bind(disabled)
+            .bind(now)
+            .bind(now)
+            .execute(&self.db)
+            .await
+            .map_err(|e| DbErr::Custom(e.to_string()))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Seeds a device-reported network into the desired-state table during
+    /// heartbeat reconcile, so the console can surface (and later take over)
+    /// networks the device owns while the device is offline.
+    ///
+    /// Unlike [`Self::upsert_network_config`] — which is the web *takeover* path
+    /// and is deliberately unguarded (web overwrites anything) — this insert
+    /// NEVER overwrites a `web`-sourced row: on conflict the update is skipped
+    /// via `WHERE source != 'web'`. Newly discovered device networks are thus
+    /// mirrored into the DB without clobbering web-managed rows.
+    ///
+    /// Returns `false` when the guard prevented the write (an existing `web` row
+    /// was left untouched).
+    pub async fn upsert_network_config_guarded(
+        &self,
+        (user_id, device_id): (UserIdInDb, Uuid),
+        network_inst_id: Uuid,
+        network_config: NetworkConfig,
+        source: ConfigSource,
+    ) -> Result<bool, DbErr> {
+        let now = chrono::Local::now().fixed_offset();
+        let network_config =
+            serde_json::to_string(&network_config).map_err(|e| DbErr::Json(e.to_string()))?;
+        let source_str = source.as_str();
+        let sql = r#"
+            INSERT INTO user_running_network_configs (
+                user_id, device_id, network_instance_id, network_config,
+                source, disabled, create_time, update_time
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, device_id, network_instance_id) DO UPDATE SET
+                network_config = excluded.network_config,
+                source = excluded.source,
+                update_time = excluded.update_time
+            WHERE user_running_network_configs.source != 'web'
+        "#;
+        let result = sqlx::query(sql)
+            .bind(user_id)
+            .bind(device_id.to_string())
+            .bind(network_inst_id.to_string())
+            .bind(network_config)
+            .bind(source_str)
+            .bind(false)
+            .bind(now)
+            .bind(now)
+            .execute(&self.db)
+            .await
+            .map_err(|e| DbErr::Custom(e.to_string()))?;
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn delete_web_network_configs(
         &self,
         (user_id, device_id): (UserIdInDb, Uuid),
@@ -621,6 +721,37 @@ impl Db {
         }
         transaction.commit().await.map_err(sqlx_db_error)?;
         Ok(())
+    }
+
+    pub async fn update_web_network_config_state(
+        &self,
+        (user_id, device_id): (UserIdInDb, Uuid),
+        network_inst_id: Uuid,
+        disabled: bool,
+    ) -> Result<bool, DbErr> {
+        use entity::user_running_network_configs as urnc;
+
+        // No `Source` filter: an offline toggle takes over the row regardless of
+        // its current source, re-sourcing it to `web` so the next heartbeat
+        // reconcile pushes the (toggled) web version. `rows_affected` is 0 only
+        // when the instance id does not exist, which the caller maps to an error.
+        let result = urnc::Entity::update_many()
+            .filter(urnc::Column::UserId.eq(user_id))
+            .filter(urnc::Column::DeviceId.eq(device_id.to_string()))
+            .filter(urnc::Column::NetworkInstanceId.eq(network_inst_id.to_string()))
+            .col_expr(urnc::Column::Disabled, Expr::value(disabled))
+            .col_expr(
+                urnc::Column::Source,
+                Expr::value(ConfigSource::Web.as_str()),
+            )
+            .col_expr(
+                urnc::Column::UpdateTime,
+                Expr::value(chrono::Local::now().fixed_offset()),
+            )
+            .exec(self.orm_db())
+            .await?;
+
+        Ok(result.rows_affected > 0)
     }
 }
 
@@ -905,6 +1036,124 @@ mod tests {
             result.get_runtime_network_config_source(),
             ConfigSource::User
         );
+    }
+
+    #[tokio::test]
+    async fn test_upsert_network_config_guarded_never_overwrites_web() {
+        let db = Db::memory_db().await;
+        let user_id = db.auto_create_user("user-guard").await.unwrap().id;
+        let device_id = uuid::Uuid::new_v4();
+        let inst_id = uuid::Uuid::new_v4();
+
+        // A user-owned row already exists in the DB. A device seed re-reporting
+        // the same network (source = User) must refresh it, not refuse.
+        db.insert_or_update_user_network_config(
+            (user_id, device_id),
+            inst_id,
+            NetworkConfig {
+                network_name: Some("device-owned".to_string()),
+                ..Default::default()
+            },
+            ConfigSource::User,
+        )
+        .await
+        .unwrap();
+
+        let written = db
+            .upsert_network_config_guarded(
+                (user_id, device_id),
+                inst_id,
+                NetworkConfig {
+                    network_name: Some("refreshed-by-device".to_string()),
+                    ..Default::default()
+                },
+                ConfigSource::User,
+            )
+            .await
+            .unwrap();
+        assert!(written, "guarded upsert must refresh an existing user row");
+        let row = user_running_network_configs::Entity::find()
+            .filter(user_running_network_configs::Column::UserId.eq(user_id))
+            .one(db.orm_db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.get_network_config_source(), ConfigSource::User);
+        assert_eq!(
+            serde_json::from_str::<NetworkConfig>(&row.network_config)
+                .unwrap()
+                .network_name
+                .as_deref(),
+            Some("refreshed-by-device")
+        );
+
+        // THE GUARD: a web-owned row must survive a device-reported user seed.
+        let web_inst = uuid::Uuid::new_v4();
+        db.upsert_network_config(
+            (user_id, device_id),
+            web_inst,
+            NetworkConfig {
+                network_name: Some("web-owned".to_string()),
+                ..Default::default()
+            },
+            ConfigSource::Web,
+            false,
+        )
+        .await
+        .unwrap();
+        let written = db
+            .upsert_network_config_guarded(
+                (user_id, device_id),
+                web_inst,
+                NetworkConfig {
+                    network_name: Some("device-tries".to_string()),
+                    ..Default::default()
+                },
+                ConfigSource::User,
+            )
+            .await
+            .unwrap();
+        assert!(!written, "guarded upsert must refuse to overwrite a web row");
+        let web_row = user_running_network_configs::Entity::find()
+            .filter(user_running_network_configs::Column::UserId.eq(user_id))
+            .filter(
+                user_running_network_configs::Column::NetworkInstanceId
+                    .eq(web_inst.to_string()),
+            )
+            .one(db.orm_db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(web_row.get_network_config_source(), ConfigSource::Web);
+        assert_eq!(
+            serde_json::from_str::<NetworkConfig>(&web_row.network_config)
+                .unwrap()
+                .network_name
+                .as_deref(),
+            Some("web-owned")
+        );
+
+        // New instance: a guarded seed of a device network succeeds.
+        let new_inst = uuid::Uuid::new_v4();
+        let written = db
+            .upsert_network_config_guarded(
+                (user_id, device_id),
+                new_inst,
+                NetworkConfig {
+                    network_name: Some("fresh-device".to_string()),
+                    ..Default::default()
+                },
+                ConfigSource::User,
+            )
+            .await
+            .unwrap();
+        assert!(written, "guarded upsert must create a new row");
+        let new_row = db
+            .get_network_config((user_id, device_id), &new_inst.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(new_row.get_network_config_source(), ConfigSource::User);
     }
 
     #[tokio::test]

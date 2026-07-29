@@ -13,6 +13,9 @@ const props = defineProps<{
     api: Api.RemoteClient;
     newConfigGenerator?: () => NetworkTypes.NetworkConfig;
     pauseAutoRefresh?: boolean;
+    // When false the device is offline: networks can still be added/edited/
+    // deleted and will be pushed on the next reconnect. A hint banner is shown.
+    deviceOnline?: boolean;
 }>();
 
 const instanceId = defineModel('instanceId', {
@@ -36,6 +39,19 @@ const listInstanceIdResponse = ref<Api.ListNetworkInstanceIdResponse | undefined
 
 const isRunning = (instanceId: string) => {
     return (listInstanceIdResponse.value?.running_inst_ids ?? []).map(Utils.UuidToStr).includes(instanceId);
+}
+
+const isPending = (instanceId: string) => {
+    // Enabled desired-state config that is not currently running. Offline this
+    // means it will be pushed when the device reconnects.
+    return (listInstanceIdResponse.value?.enabled_inst_ids ?? []).map(Utils.UuidToStr).includes(instanceId);
+}
+
+const isUser = (instanceId: string) => {
+    // Device-owned (source != 'web') desired-state config. The console can take
+    // it over while the device is offline; until then it is neither a running,
+    // web-managed-pending, nor disabled row.
+    return (listInstanceIdResponse.value?.user_inst_ids ?? []).map(Utils.UuidToStr).includes(instanceId);
 }
 
 const networkMetaCache = ref<Record<string, Api.NetworkMeta>>({});
@@ -81,7 +97,9 @@ const updateInstanceList = () => {
     let t = listInstanceIdResponse.value;
     if (t) {
         (t.running_inst_ids ?? []).forEach((u) => insts.add(Utils.UuidToStr(u)));
+        (t.enabled_inst_ids ?? []).forEach((u) => insts.add(Utils.UuidToStr(u)));
         (t.disabled_inst_ids ?? []).forEach((u) => insts.add(Utils.UuidToStr(u)));
+        (t.user_inst_ids ?? []).forEach((u) => insts.add(Utils.UuidToStr(u)));
     }
 
     const newList = Array.from(insts).map((instance: string) => {
@@ -118,7 +136,7 @@ const selectedInstanceId = computed({
     }
 });
 watch(selectedInstanceId, async (newVal, oldVal) => {
-    if (newVal?.uuid !== oldVal?.uuid && (networkIsDisabled.value || isEditingNetwork.value)) {
+    if (newVal?.uuid !== oldVal?.uuid && (networkIsDisabled.value || networkIsPending.value || networkIsUser.value || isEditingNetwork.value)) {
         await loadCurrentNetworkConfig();
     } else {
         await loadCurrentNetworkInfo();
@@ -129,13 +147,32 @@ watch(selectedInstanceId, async (newVal, oldVal) => {
     }
 });
 
+const networkIsPending = computed(() => {
+    if (!selectedInstanceId.value) {
+        return false;
+    }
+    return (listInstanceIdResponse.value?.enabled_inst_ids ?? [])
+        .map(Utils.UuidToStr)
+        .includes(selectedInstanceId.value?.uuid);
+})
+
 const needShowNetworkStatus = computed(() => {
     if (!selectedInstanceId.value) {
         // nothing selected
         return false;
     }
+    if (networkIsUser.value) {
+        // Device-owned row offered for takeover: there is no live runtime status
+        // to show until the console takes it over.
+        return false;
+    }
     if (networkIsDisabled.value) {
         // network is disabled
+        return false;
+    }
+    if (networkIsPending.value) {
+        // network is enabled but not running (e.g. device offline) — no live
+        // runtime status to show
         return false;
     }
     if (isEditingNetwork.value) {
@@ -150,6 +187,13 @@ const networkIsDisabled = computed(() => {
         return false;
     }
     return (listInstanceIdResponse.value?.disabled_inst_ids ?? []).map(Utils.UuidToStr).includes(selectedInstanceId.value?.uuid);
+});
+
+const networkIsUser = computed(() => {
+    if (!selectedInstanceId.value) {
+        return false;
+    }
+    return (listInstanceIdResponse.value?.user_inst_ids ?? []).map(Utils.UuidToStr).includes(selectedInstanceId.value?.uuid);
 });
 watch(networkIsDisabled, async (newVal, oldVal) => {
     if (newVal !== oldVal && newVal === true) {
@@ -218,7 +262,7 @@ const saveAndRunNewNetwork = async (config?: NetworkTypes.NetworkConfig) => {
     }
 
     try {
-        if (networkIsDisabled.value) {
+        if (networkIsDisabled.value || networkIsUser.value) {
             await props.api.save_config(cfg);
             await props.api.update_network_instance_state(cfg.instance_id, false);
         } else {
@@ -420,7 +464,7 @@ const actionMenu: Ref<MenuItem[]> = ref([
     {
         label: () => t('web.device_management.edit_network'),
         icon: 'pi pi-pencil',
-        visible: () => !(networkIsDisabled.value ?? true) && currentNetworkControl.editable.value,
+        visible: () => networkIsUser.value ? true : (!(networkIsDisabled.value ?? true) && currentNetworkControl.editable.value),
         command: () => editNetwork()
     },
     {
@@ -432,7 +476,7 @@ const actionMenu: Ref<MenuItem[]> = ref([
         label: () => t('web.device_management.delete_network'),
         icon: 'pi pi-trash',
         class: 'p-error',
-        visible: () => currentNetworkControl.deletable.value,
+        visible: () => !networkIsUser.value && currentNetworkControl.deletable.value,
         command: () => confirmDeleteNetwork(new Event('click'))
     }
 ]);
@@ -498,8 +542,8 @@ onUnmounted(() => {
                                         </span>
                                     </div>
                                     <Tag class="my-auto leading-3 shrink-0"
-                                        :severity="isRunning(slotProps.value.uuid) ? 'success' : 'info'"
-                                        :value="t(isRunning(slotProps.value.uuid) ? 'network_running' : 'network_stopped')" />
+                                        :severity="isRunning(slotProps.value.uuid) ? 'success' : isUser(slotProps.value.uuid) ? 'secondary' : isPending(slotProps.value.uuid) ? 'warn' : 'info'"
+                                        :value="t(isRunning(slotProps.value.uuid) ? 'network_running' : isUser(slotProps.value.uuid) ? 'network_pending_takeover' : isPending(slotProps.value.uuid) ? 'network_pending' : 'network_stopped')" />
                                 </div>
                                 <span v-else>
                                     {{ slotProps.placeholder }}
@@ -513,8 +557,8 @@ onUnmounted(() => {
                                                 slotProps.option.meta?.network_name ?? slotProps.option.uuid }}</span>
                                         </div>
                                         <Tag class="my-auto leading-3 shrink-0"
-                                            :severity="isRunning(slotProps.option.uuid) ? 'success' : 'info'"
-                                            :value="t(isRunning(slotProps.option.uuid) ? 'network_running' : 'network_stopped')" />
+                                            :severity="isRunning(slotProps.option.uuid) ? 'success' : isUser(slotProps.option.uuid) ? 'secondary' : isPending(slotProps.option.uuid) ? 'warn' : 'info'"
+                                            :value="t(isRunning(slotProps.option.uuid) ? 'network_running' : isUser(slotProps.option.uuid) ? 'network_pending_takeover' : isPending(slotProps.option.uuid) ? 'network_pending' : 'network_stopped')" />
                                     </div>
                                     <div class="max-w-full overflow-hidden text-ellipsis text-gray-500">
                                         {{ slotProps.option.uuid }}
@@ -557,8 +601,12 @@ onUnmounted(() => {
 
         <!-- Main Content Area -->
         <div class="network-content bg-surface-0 p-4 rounded-lg shadow-sm">
+            <Message v-if="deviceOnline === false" severity="warn" class="mb-3">
+                {{ t('web.device_management.offline_network_hint') }}
+            </Message>
+
             <!-- Network Creation Form -->
-            <div v-if="isEditingNetwork || networkIsDisabled" class="network-creation-container">
+            <div v-if="isEditingNetwork || networkIsDisabled || networkIsPending" class="network-creation-container">
                 <div class="network-creation-header flex items-center gap-2 mb-3">
                     <i class="pi pi-plus-circle text-primary text-xl"></i>
                     <h2 class="text-xl font-medium">{{ t('web.device_management.edit_network') }}</h2>

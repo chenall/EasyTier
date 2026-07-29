@@ -213,22 +213,15 @@ impl NetworkApi {
         Path(machine_id): Path<uuid::Uuid>,
         Json(payload): Json<RunNetworkJsonReq>,
     ) -> Result<Json<Void>, HttpHandleError> {
-        let user_id = Self::get_user_id(&auth_session)?;
         client_mgr
-            .invalidate_applied_config_revision(user_id, machine_id)
-            .await;
-        let result = client_mgr
-            .handle_run_network_instance_with_source(
-                (user_id, machine_id),
+            .run_network_instance_offline_aware(
+                (Self::get_user_id(&auth_session)?, machine_id),
                 payload.config,
                 payload.save,
                 RuntimeConfigSource::Web,
             )
-            .await;
-        client_mgr
-            .invalidate_applied_config_revision(user_id, machine_id)
-            .await;
-        result.map_err(convert_error)?;
+            .await
+            .map_err(convert_error)?;
         Ok(Void::default().into())
     }
 
@@ -269,7 +262,7 @@ impl NetworkApi {
         Path(machine_id): Path<uuid::Uuid>,
     ) -> Result<Json<ListNetworkInstanceIdsJsonResp>, HttpHandleError> {
         Ok(client_mgr
-            .handle_list_network_instance_ids((Self::get_user_id(&auth_session)?, machine_id))
+            .list_network_instance_ids_offline_aware((Self::get_user_id(&auth_session)?, machine_id))
             .await
             .map_err(convert_error)?
             .into())
@@ -280,18 +273,13 @@ impl NetworkApi {
         State(client_mgr): AppState,
         Path((machine_id, inst_id)): Path<(uuid::Uuid, uuid::Uuid)>,
     ) -> Result<(), HttpHandleError> {
-        let user_id = Self::get_user_id(&auth_session)?;
         client_mgr
-            .invalidate_applied_config_revision(user_id, machine_id)
-            .await;
-        let result = client_mgr
-            .handle_remove_network_instances((user_id, machine_id), vec![inst_id])
-            .await;
-        client_mgr
-            .invalidate_applied_config_revision(user_id, machine_id)
-            .await;
-        result.map_err(convert_error)?;
-        Ok(())
+            .remove_network_instances_offline_aware(
+                (Self::get_user_id(&auth_session)?, machine_id),
+                vec![inst_id],
+            )
+            .await
+            .map_err(convert_error)
     }
 
     async fn handle_list_machines(
@@ -462,18 +450,14 @@ impl NetworkApi {
             ));
         };
 
-        let user_id = Self::get_user_id(&auth_session)?;
         client_mgr
-            .invalidate_applied_config_revision(user_id, machine_id)
-            .await;
-        let result = client_mgr
-            .handle_update_network_state((user_id, machine_id), inst_id, payload.disabled)
-            .await;
-        client_mgr
-            .invalidate_applied_config_revision(user_id, machine_id)
-            .await;
-        result.map_err(convert_error)?;
-        Ok(())
+            .update_network_state_offline_aware(
+                (auth_session.user.unwrap().id(), machine_id),
+                inst_id,
+                payload.disabled,
+            )
+            .await
+            .map_err(convert_error)
     }
 
     async fn handle_get_network_metas(
@@ -505,23 +489,15 @@ impl NetworkApi {
                 other_error("Instance ID mismatch".to_string()).into(),
             ));
         }
-        let user_id = Self::get_user_id(&auth_session)?;
         client_mgr
-            .invalidate_applied_config_revision(user_id, machine_id)
-            .await;
-        let result = client_mgr
-            .handle_save_network_config_with_source(
-                (user_id, machine_id),
+            .save_network_config_offline_aware(
+                (Self::get_user_id(&auth_session)?, machine_id),
                 inst_id,
                 payload.config,
                 RuntimeConfigSource::Web,
             )
-            .await;
-        client_mgr
-            .invalidate_applied_config_revision(user_id, machine_id)
-            .await;
-        result.map_err(convert_error)?;
-        Ok(())
+            .await
+            .map_err(convert_error)
     }
 
     async fn handle_get_network_config(

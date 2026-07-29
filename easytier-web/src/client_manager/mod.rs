@@ -13,8 +13,13 @@ use dashmap::DashMap;
 use easytier::proto::{
     api::manage::WebClientService, rpc_types::controller::BaseController, web::HeartbeatRequest,
 };
+use easytier::common::config::ConfigSource;
+use easytier::proto::api::manage::NetworkConfig;
 use easytier_core::{
-    management::remote_client::{self, RemoteClientManager},
+    management::remote_client::{
+        self, ListNetworkInstanceIdsJsonResp, ListNetworkProps, RemoteClientManager,
+        RemoteClientError, Storage as _,
+    },
     socket::SocketListener,
     tunnel::{Tunnel, web_security},
 };
@@ -537,6 +542,211 @@ impl
     }
 }
 
+/// Set the network instance id inside a `NetworkConfig` so the persisted JSON
+/// stays consistent with the DB `network_instance_id` column that reconcile
+/// uses to match running vs desired state. Falls back to the original config
+/// if it cannot be re-serialized.
+fn with_instance_id(config: NetworkConfig, inst_id: &uuid::Uuid) -> NetworkConfig {
+    match serde_json::to_value(&config) {
+        Ok(mut value) => {
+            if let serde_json::Value::Object(ref mut map) = value {
+                map.insert(
+                    "instanceId".to_string(),
+                    serde_json::Value::String(inst_id.to_string()),
+                );
+                if let Ok(updated) = serde_json::from_value::<NetworkConfig>(value) {
+                    return updated;
+                }
+            }
+            config
+        }
+        Err(_) => config,
+    }
+}
+
+impl ClientManager {
+    /// Online: delegate to the RPC-backed default (runs on the device + persists).
+    /// Offline: persist the desired-state row so the next heartbeat reconcile
+    /// pushes it to the device. There is no live client to run against.
+    pub async fn run_network_instance_offline_aware(
+        &self,
+        identify: (UserIdInDb, uuid::Uuid),
+        config: NetworkConfig,
+        save: bool,
+        source: ConfigSource,
+    ) -> Result<(), RemoteClientError<sea_orm::DbErr>> {
+        if self.get_rpc_client(identify).is_some() {
+            return self
+                .handle_run_network_instance_with_source(identify, config, save, source)
+                .await;
+        }
+        if !save {
+            // Nothing to run and nothing to persist.
+            return Ok(());
+        }
+        let inst_id = match config.instance_id() {
+            s if !s.is_empty() => uuid::Uuid::parse_str(&s).unwrap_or_else(|_| uuid::Uuid::new_v4()),
+            _ => uuid::Uuid::new_v4(),
+        };
+        let config = with_instance_id(config, &inst_id);
+        let written = self
+            .db()
+            .upsert_network_config(identify, inst_id, config, source, false)
+            .await
+            .map_err(RemoteClientError::PersistentError)?;
+        if !written {
+            return Err(RemoteClientError::Other(format!(
+                "refused to overwrite user-owned network config {inst_id}"
+            )));
+        }
+        self.bump_managed_config_revision(identify).await?;
+        Ok(())
+    }
+
+    /// Online: default save (persist only). Offline: persist the desired-state
+    /// row, preserving the existing `disabled` flag (new configs default to
+    /// enabled so they are pushed on next reconnect).
+    pub async fn save_network_config_offline_aware(
+        &self,
+        identify: (UserIdInDb, uuid::Uuid),
+        inst_id: uuid::Uuid,
+        config: NetworkConfig,
+        source: ConfigSource,
+    ) -> Result<(), RemoteClientError<sea_orm::DbErr>> {
+        if self.get_rpc_client(identify).is_some() {
+            return self
+                .handle_save_network_config_with_source(identify, inst_id, config, source)
+                .await;
+        }
+        let existing = self
+            .db()
+            .get_network_config(identify, &inst_id.to_string())
+            .await
+            .map_err(RemoteClientError::PersistentError)?;
+        let disabled = existing.map(|row| row.disabled).unwrap_or(false);
+        let written = self
+            .db()
+            .upsert_network_config(identify, inst_id, config, source, disabled)
+            .await
+            .map_err(RemoteClientError::PersistentError)?;
+        if !written {
+            return Err(RemoteClientError::Other(format!(
+                "refused to overwrite user-owned network config {inst_id}"
+            )));
+        }
+        self.bump_managed_config_revision(identify).await?;
+        Ok(())
+    }
+
+    /// Online: default remove (stop instance + delete row). Offline: just delete
+    /// the desired-state row; on reconnect the device has nothing to stop and
+    /// reconcile will not start it.
+    pub async fn remove_network_instances_offline_aware(
+        &self,
+        identify: (UserIdInDb, uuid::Uuid),
+        inst_ids: Vec<uuid::Uuid>,
+    ) -> Result<(), RemoteClientError<sea_orm::DbErr>> {
+        if self.get_rpc_client(identify).is_some() {
+            return self.handle_remove_network_instances(identify, inst_ids).await;
+        }
+        self.db()
+            .delete_web_network_configs(identify, &inst_ids)
+            .await
+            .map_err(RemoteClientError::PersistentError)?;
+        Ok(())
+    }
+
+    /// Online: default toggle (stop/start the running instance). Offline: just
+    /// flip the `disabled` flag; on reconnect reconcile honors it (enabled =>
+    /// pushed, disabled => not started).
+    pub async fn update_network_state_offline_aware(
+        &self,
+        identify: (UserIdInDb, uuid::Uuid),
+        inst_id: uuid::Uuid,
+        disabled: bool,
+    ) -> Result<(), RemoteClientError<sea_orm::DbErr>> {
+        if self.get_rpc_client(identify).is_some() {
+            return self
+                .handle_update_network_state(identify, inst_id, disabled)
+                .await;
+        }
+        let changed = self
+            .db()
+            .update_web_network_config_state(identify, inst_id, disabled)
+            .await
+            .map_err(RemoteClientError::PersistentError)?;
+        if !changed {
+            return Err(RemoteClientError::Other(format!(
+                "refused to toggle user-owned network config {inst_id}"
+            )));
+        }
+        self.bump_managed_config_revision(identify).await?;
+        Ok(())
+    }
+
+    /// Offline web writes (takeover/edit/toggle) persist a desired-state row,
+    /// but an already-running instance is only re-pushed when a managed-config
+    /// revision is pending (reconcile_desired_runtime_configs skips running
+    /// web instances unless `should_apply_runtime_revision` is true). Bump the
+    /// revision after an offline write so the next heartbeat converges the
+    /// running instance onto the new config instead of keeping the device's
+    /// stale copy. Online writes return early and never reach this.
+    async fn bump_managed_config_revision(
+        &self,
+        identify: (UserIdInDb, uuid::Uuid),
+    ) -> Result<(), RemoteClientError<sea_orm::DbErr>> {
+        self.db()
+            .set_managed_config_revision(identify, &uuid::Uuid::new_v4().to_string())
+            .await
+            .map_err(RemoteClientError::PersistentError)
+    }
+
+    /// Online: delegate to the RPC-backed default (reads running instances
+    /// from the device + disabled rows from DB). Offline: nothing is running
+    /// on the device, so report stored desired-state rows as enabled (pending
+    /// push on reconnect) and disabled, with an empty running set. This lets
+    /// the web UI enumerate and manage a device's networks even while it is
+    /// offline.
+    pub async fn list_network_instance_ids_offline_aware(
+        &self,
+        identify: (UserIdInDb, uuid::Uuid),
+    ) -> Result<ListNetworkInstanceIdsJsonResp, RemoteClientError<sea_orm::DbErr>> {
+        if self.get_rpc_client(identify).is_some() {
+            return self.handle_list_network_instance_ids(identify).await;
+        }
+        let rows = self
+            .db()
+            .list_network_configs(identify, ListNetworkProps::All)
+            .await
+            .map_err(RemoteClientError::PersistentError)?;
+        let mut enabled_inst_ids = Vec::new();
+        let mut disabled_inst_ids = Vec::new();
+        let mut user_inst_ids = Vec::new();
+        for row in rows {
+            let id = Into::<easytier::proto::common::Uuid>::into(row.network_instance_id.clone());
+            if row.source == ConfigSource::Web.as_str() {
+                // Web-owned desired state, pushed on reconnect.
+                if row.disabled {
+                    disabled_inst_ids.push(id);
+                } else {
+                    enabled_inst_ids.push(id);
+                }
+            } else {
+                // Device-owned (source != 'web'): surface it so the UI can offer
+                // a takeover. Web becomes authoritative only once the user edits
+                // it (the save/toggle paths re-source the row to 'web').
+                user_inst_ids.push(id);
+            }
+        }
+        Ok(ListNetworkInstanceIdsJsonResp {
+            running_inst_ids: Vec::new(),
+            enabled_inst_ids,
+            disabled_inst_ids,
+            user_inst_ids,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -566,8 +776,9 @@ mod tests {
         },
         web_client::{WebClient, run_web_client},
     };
+    use easytier::common::config::ConfigSource;
     use easytier_core::management::remote_client::{
-        RemoteClientManager as _, Storage as RemoteStorage,
+        RemoteClientManager as _, Storage as RemoteStorage, ListNetworkProps,
     };
     use serde_json::json;
     use sqlx::Executor;
@@ -577,6 +788,261 @@ mod tests {
     };
 
     const MANAGED_CONFIG_TOKEN: &str = "managed-config-token";
+
+    #[tokio::test]
+    async fn offline_network_add_modify_delete_and_toggle() {
+        let mgr = ClientManager::new(
+            Db::memory_db().await,
+            None,
+            Duration::ZERO,
+            Arc::new(FeatureFlags::default()),
+            Arc::new(crate::webhook::WebhookConfig::new(None, None, None, None, None)),
+        );
+        let user_id = mgr
+            .db()
+            .auto_create_user("offline-network-user")
+            .await
+            .unwrap()
+            .id;
+        // No session for this machine => every handler takes the offline branch.
+        let machine_id = uuid::Uuid::new_v4();
+
+        // Offline add: persisted as enabled web-sourced desired state.
+        let config = NetworkConfig {
+            network_name: Some("offline-net".to_string()),
+            ..Default::default()
+        };
+        mgr.run_network_instance_offline_aware((user_id, machine_id), config, true, ConfigSource::Web)
+            .await
+            .unwrap();
+
+        let mut rows = mgr
+            .db()
+            .list_network_configs((user_id, machine_id), ListNetworkProps::All)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = rows.remove(0);
+        assert_eq!(row.source, "web");
+        assert!(
+            !row.disabled,
+            "offline-added config must stay enabled so it is pushed on reconnect"
+        );
+        let inst_id = row.network_instance_id.clone();
+
+        // Offline list: the added config shows as enabled (pending on reconnect),
+        // with no running instances and no disabled rows.
+        let list = mgr
+            .list_network_instance_ids_offline_aware((user_id, machine_id))
+            .await
+            .unwrap();
+        assert_eq!(list.running_inst_ids.len(), 0);
+        assert_eq!(list.disabled_inst_ids.len(), 0);
+        assert_eq!(list.enabled_inst_ids.len(), 1);
+        assert_eq!(
+            uuid::Uuid::from(list.enabled_inst_ids[0]),
+            uuid::Uuid::parse_str(&inst_id).unwrap(),
+        );
+
+        // Offline modify: config replaced, enabled flag preserved.
+        let updated = NetworkConfig {
+            network_name: Some("offline-net-v2".to_string()),
+            ..Default::default()
+        };
+        mgr.save_network_config_offline_aware(
+            (user_id, machine_id),
+            uuid::Uuid::parse_str(&inst_id).unwrap(),
+            updated,
+            ConfigSource::Web,
+        )
+        .await
+        .unwrap();
+        let row = mgr
+            .db()
+            .get_network_config((user_id, machine_id), &inst_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let stored: NetworkConfig = serde_json::from_str(&row.network_config).unwrap();
+        assert_eq!(stored.network_name.as_deref(), Some("offline-net-v2"));
+        assert!(!row.disabled);
+
+        // Offline disable then enable.
+        let inst = uuid::Uuid::parse_str(&inst_id).unwrap();
+        mgr.update_network_state_offline_aware((user_id, machine_id), inst, true)
+            .await
+            .unwrap();
+        assert!(
+            mgr.db()
+                .get_network_config((user_id, machine_id), &inst_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .disabled
+        );
+        mgr.update_network_state_offline_aware((user_id, machine_id), inst, false)
+            .await
+            .unwrap();
+        assert!(
+            !mgr.db()
+                .get_network_config((user_id, machine_id), &inst_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .disabled
+        );
+
+        // Offline delete: row removed.
+        mgr.remove_network_instances_offline_aware((user_id, machine_id), vec![inst])
+            .await
+            .unwrap();
+        assert!(
+            mgr.db()
+                .get_network_config((user_id, machine_id), &inst_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_network_takes_over_user_owned_config() {
+        let mgr = ClientManager::new(
+            Db::memory_db().await,
+            None,
+            Duration::ZERO,
+            Arc::new(FeatureFlags::default()),
+            Arc::new(crate::webhook::WebhookConfig::new(None, None, None, None, None)),
+        );
+        let user_id = mgr
+            .db()
+            .auto_create_user("offline-takeover-user")
+            .await
+            .unwrap()
+            .id;
+        let machine_id = uuid::Uuid::new_v4();
+        let inst_id = uuid::Uuid::new_v4();
+
+        // Seed a device-owned (user-sourced) row directly, simulating a config
+        // the device brought up from a file or its own runtime.
+        mgr.db()
+            .insert_or_update_user_network_config(
+                (user_id, machine_id),
+                inst_id,
+                NetworkConfig {
+                    network_name: Some("device-net".to_string()),
+                    ..Default::default()
+                },
+                ConfigSource::User,
+            )
+            .await
+            .unwrap();
+
+        // Offline list surfaces it as a takeoverable (user) instance, not as a
+        // web-managed enabled/disabled row.
+        let list = mgr
+            .list_network_instance_ids_offline_aware((user_id, machine_id))
+            .await
+            .unwrap();
+        assert_eq!(list.user_inst_ids.len(), 1);
+        assert_eq!(list.enabled_inst_ids.len(), 0);
+        assert_eq!(list.disabled_inst_ids.len(), 0);
+
+        // Web is NOT allowed to delete a device-owned row offline: the delete is
+        // a safe no-op and the row survives (consistent with online behavior).
+        mgr.remove_network_instances_offline_aware((user_id, machine_id), vec![inst_id])
+            .await
+            .unwrap();
+        let row = mgr
+            .db()
+            .get_network_config((user_id, machine_id), &inst_id.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.source, "user", "user-owned row must survive web delete");
+
+        // Offline save takes the row over: re-sourced to web and config updated.
+        mgr.save_network_config_offline_aware(
+            (user_id, machine_id),
+            inst_id,
+            NetworkConfig {
+                network_name: Some("web-net".to_string()),
+                ..Default::default()
+            },
+            ConfigSource::Web,
+        )
+        .await
+        .unwrap();
+        let row = mgr
+            .db()
+            .get_network_config((user_id, machine_id), &inst_id.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.source, "web", "takeover must re-source the row to web");
+        assert_eq!(
+            serde_json::from_str::<NetworkConfig>(&row.network_config)
+                .unwrap()
+                .network_name
+                .as_deref(),
+            Some("web-net")
+        );
+        assert!(!row.disabled, "taken-over row stays enabled so it is pushed");
+
+        // Offline takeover must also bump the managed-config revision so the
+        // device converges the running instance onto the new config on the next
+        // heartbeat (otherwise an already-running instance is never re-pushed).
+        let rev_after_save = mgr
+            .db()
+            .get_managed_config_revision((user_id, machine_id))
+            .await
+            .unwrap();
+        assert!(
+            rev_after_save.is_some(),
+            "offline takeover must bump the managed-config revision"
+        );
+
+        // After takeover the row is web-managed: list reports it as enabled.
+        let list = mgr
+            .list_network_instance_ids_offline_aware((user_id, machine_id))
+            .await
+            .unwrap();
+        assert_eq!(list.enabled_inst_ids.len(), 1);
+        assert_eq!(list.user_inst_ids.len(), 0);
+
+        // Offline toggle takes the (now web) row over to disabled.
+        mgr.update_network_state_offline_aware((user_id, machine_id), inst_id, true)
+            .await
+            .unwrap();
+        assert!(
+            mgr.db()
+                .get_network_config((user_id, machine_id), &inst_id.to_string())
+                .await
+                .unwrap()
+                .unwrap()
+                .disabled
+        );
+        let list = mgr
+            .list_network_instance_ids_offline_aware((user_id, machine_id))
+            .await
+            .unwrap();
+        assert_eq!(list.disabled_inst_ids.len(), 1);
+        assert_eq!(list.enabled_inst_ids.len(), 0);
+
+        // Toggle also bumps the revision, to a fresh value, so a reconnect
+        // re-reconciles even if an earlier revision was already applied.
+        let rev_after_toggle = mgr
+            .db()
+            .get_managed_config_revision((user_id, machine_id))
+            .await
+            .unwrap();
+        assert!(rev_after_toggle.is_some());
+        assert_ne!(
+            rev_after_save,
+            rev_after_toggle,
+            "each offline write must bump to a fresh revision"
+        );
+    }
 
     async fn wait_for_condition<F, Fut>(mut condition: F, timeout: Duration)
     where

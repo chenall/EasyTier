@@ -147,7 +147,9 @@ where
 
         Ok(ListNetworkInstanceIdsJsonResp {
             running_inst_ids,
+            enabled_inst_ids: Vec::new(),
             disabled_inst_ids,
+            user_inst_ids: Vec::new(),
         })
     }
 
@@ -392,8 +394,16 @@ pub enum ListNetworkProps {
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct ListNetworkInstanceIdsJsonResp {
-    running_inst_ids: Vec<easytier_proto::common::Uuid>,
-    disabled_inst_ids: Vec<easytier_proto::common::Uuid>,
+    pub running_inst_ids: Vec<easytier_proto::common::Uuid>,
+    /// Enabled desired-state rows that are NOT currently running. When the
+    /// device is offline this is the set of configs that will be pushed on the
+    /// next reconnect (the device has no running instances to report).
+    pub enabled_inst_ids: Vec<easytier_proto::common::Uuid>,
+    pub disabled_inst_ids: Vec<easytier_proto::common::Uuid>,
+    /// Device-owned (source != 'web') desired-state rows. The console can take
+    /// these over while the device is offline; this list lets the UI surface
+    /// them with a "pending takeover" affordance. Always empty on the online path.
+    pub user_inst_ids: Vec<easytier_proto::common::Uuid>,
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]

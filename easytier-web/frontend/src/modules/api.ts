@@ -1,5 +1,5 @@
 import axios, { AxiosError, AxiosInstance, AxiosResponse, InternalAxiosRequestConfig } from 'axios';
-import { type Api, NetworkTypes, Utils } from 'easytier-frontend-lib';
+import { type Api, NetworkTypes } from 'easytier-frontend-lib';
 import { Md5 } from 'ts-md5';
 
 export interface ValidateConfigResponse {
@@ -34,11 +34,6 @@ export interface RegisterData {
 
 export interface Summary {
     device_count: number;
-}
-
-export interface ListNetworkInstanceIdResponse {
-    running_inst_ids: Array<Utils.UUID>,
-    disabled_inst_ids: Array<Utils.UUID>,
 }
 
 export interface GenerateConfigRequest {
@@ -283,7 +278,7 @@ class WebRemoteClient implements Api.RemoteClient {
         await this.patch_vpn_portal_clients(inst_id, [{ action: 'CLEAR' }]);
     }
     async list_network_instance_ids(): Promise<Api.ListNetworkInstanceIdResponse> {
-        const response = await this.client.get<any, ListNetworkInstanceIdResponse>('/machines/' + this.machine_id + '/networks');
+        const response = await this.client.get<any, Api.ListNetworkInstanceIdResponse>('/machines/' + this.machine_id + '/networks');
         return response;
     }
     async delete_network(inst_id: string): Promise<undefined> {

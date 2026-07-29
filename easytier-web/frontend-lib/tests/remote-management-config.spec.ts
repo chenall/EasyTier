@@ -225,4 +225,121 @@ describe('RemoteManagement config save', () => {
       wrapper.unmount()
     }
   })
+
+  it('shows pending-on-reconnect state and offline hint for an offline device', async () => {
+    const api = {
+      delete_network: vi.fn(),
+      generate_config: vi.fn(),
+      get_network_config: vi.fn(async () => cloneConfig(makeFlagConfig())),
+      get_network_info: vi.fn(),
+      get_network_metas: vi.fn(async (instanceIds: string[]) => ({
+        metas: Object.fromEntries(instanceIds.map((id: string) => [id, {
+          config_permission: 0xffffffff,
+          inst_id: INSTANCE_UUID,
+          instance_name: 'mesh-save',
+          network_name: 'mesh-save',
+          source: 2,
+        }])),
+      })),
+      list_network_instance_ids: vi.fn(async () => ({
+        enabled_inst_ids: [INSTANCE_UUID],
+        running_inst_ids: [],
+        disabled_inst_ids: [],
+      })),
+      parse_config: vi.fn(),
+      run_network: vi.fn(),
+      save_config: vi.fn(async () => undefined),
+      update_network_instance_state: vi.fn(),
+      validate_config: vi.fn(),
+    }
+
+    const wrapper = mount(RemoteManagement, {
+      props: {
+        api,
+        instanceId: INSTANCE_ID,
+        deviceOnline: false,
+      },
+      global: {
+        stubs: {
+          Config: true,
+          ConfigEditDialog: true,
+          Status: true,
+        },
+      },
+    })
+
+    try {
+      await settleRemoteManagement()
+
+      // Offline hint banner is shown when the device is offline.
+      expect(wrapper.text()).toContain('web.device_management.offline_network_hint')
+
+      // The enabled-but-not-running network is tagged as pending-on-reconnect.
+      const pendingTag = wrapper.find('[data-value="network_pending"]')
+      expect(pendingTag.exists()).toBe(true)
+    } finally {
+      wrapper.unmount()
+    }
+  })
+
+  it('surfaces a device-owned network as pending-takeover and hides delete', async () => {
+    const api = {
+      delete_network: vi.fn(),
+      generate_config: vi.fn(),
+      get_network_config: vi.fn(async () => cloneConfig(makeFlagConfig())),
+      get_network_info: vi.fn(),
+      get_network_metas: vi.fn(async (instanceIds: string[]) => ({
+        metas: Object.fromEntries(instanceIds.map((id: string) => [id, {
+          config_permission: 0xffffffff,
+          inst_id: INSTANCE_UUID,
+          instance_name: 'device-net',
+          network_name: 'device-net',
+          source: 2,
+        }])),
+      })),
+      list_network_instance_ids: vi.fn(async () => ({
+        user_inst_ids: [INSTANCE_UUID],
+        running_inst_ids: [],
+        enabled_inst_ids: [],
+        disabled_inst_ids: [],
+      })),
+      parse_config: vi.fn(),
+      run_network: vi.fn(),
+      save_config: vi.fn(async () => undefined),
+      update_network_instance_state: vi.fn(),
+      validate_config: vi.fn(),
+    }
+
+    const wrapper = mount(RemoteManagement, {
+      props: {
+        api,
+        instanceId: INSTANCE_ID,
+        deviceOnline: false,
+      },
+      global: {
+        stubs: {
+          Config: true,
+          ConfigEditDialog: true,
+          Status: true,
+        },
+      },
+    })
+
+    try {
+      await settleRemoteManagement()
+
+      // Device-owned (source != 'web') row is shown as a pending-takeover tag.
+      const takeoverTag = wrapper.find('[data-value="network_pending_takeover"]')
+      expect(takeoverTag.exists()).toBe(true)
+
+      // The console may take it over (edit shown) but must never delete it.
+      const menu = (wrapper.vm as unknown as { actionMenu: Array<{ label: () => string; visible: () => boolean }> }).actionMenu
+      const editItem = menu.find((i) => i.label() === 'web.device_management.edit_network')
+      const deleteItem = menu.find((i) => i.label() === 'web.device_management.delete_network')
+      expect(editItem?.visible()).toBe(true)
+      expect(deleteItem?.visible()).toBe(false)
+    } finally {
+      wrapper.unmount()
+    }
+  })
 })
