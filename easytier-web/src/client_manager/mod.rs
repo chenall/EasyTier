@@ -580,10 +580,11 @@ impl ClientManager {
                 .handle_run_network_instance_with_source(identify, config, save, source)
                 .await;
         }
-        if !save {
-            // Nothing to run and nothing to persist.
-            return Ok(());
-        }
+        // Offline: there is no device to run against, so the only meaningful
+        // action is to persist the desired-state row. We persist regardless of
+        // `save` — a "run without save" offline would otherwise be a silent
+        // no-op and a newly created network would never appear (nor be pushed
+        // on reconnect). Online callers still honor `save` via the default path.
         let inst_id = match config.instance_id() {
             s if !s.is_empty() => uuid::Uuid::parse_str(&s).unwrap_or_else(|_| uuid::Uuid::new_v4()),
             _ => uuid::Uuid::new_v4(),
@@ -1041,6 +1042,53 @@ mod tests {
             rev_after_save,
             rev_after_toggle,
             "each offline write must bump to a fresh revision"
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_run_without_save_still_persists() {
+        let mgr = ClientManager::new(
+            Db::memory_db().await,
+            None,
+            Duration::ZERO,
+            Arc::new(FeatureFlags::default()),
+            Arc::new(crate::webhook::WebhookConfig::new(None, None, None, None, None)),
+        );
+        let user_id = mgr
+            .db()
+            .auto_create_user("offline-save-user")
+            .await
+            .unwrap()
+            .id;
+        let machine_id = uuid::Uuid::new_v4();
+
+        // Offline "run without save" must still persist the desired-state row.
+        // There is no device to run against offline, so the only meaningful
+        // action is to persist; otherwise a newly created network would silently
+        // vanish with nothing to push on reconnect.
+        let config = NetworkConfig {
+            network_name: Some("offline-no-save".to_string()),
+            ..Default::default()
+        };
+        mgr.run_network_instance_offline_aware(
+            (user_id, machine_id),
+            config,
+            false,
+            ConfigSource::Web,
+        )
+        .await
+        .unwrap();
+
+        let rows = mgr
+            .db()
+            .list_network_configs((user_id, machine_id), ListNetworkProps::All)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "offline run without save must persist the row");
+        assert_eq!(rows[0].source, "web");
+        assert!(
+            !rows[0].disabled,
+            "persisted offline run must stay enabled so it is pushed on reconnect"
         );
     }
 

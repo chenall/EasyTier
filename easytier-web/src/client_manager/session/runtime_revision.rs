@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use easytier::common::config::ConfigSource;
 use easytier::proto::{
     api::manage::{
         DeleteNetworkInstanceRequest, DeleteNetworkInstanceResponse, GetNetworkInstanceConfigRequest,
@@ -631,6 +632,16 @@ async fn seed_running_device_networks(
             continue;
         };
 
+        // Web-sourced instances are owned exclusively by the web console. If a
+        // running instance reports `web` but has no web row in the DB, it was
+        // deleted while the device was offline — never resurrect it here. Only
+        // device-owned (`user`-sourced) networks are mirrored so they can be
+        // surfaced and taken over. Resurrecting a deleted web instance would
+        // silently undo an offline delete on the next heartbeat.
+        if running_source == ConfigSource::Web {
+            continue;
+        }
+
         let resp = match rpc_client
             .get_network_instance_config(
                 BaseController::default(),
@@ -1214,9 +1225,95 @@ fn record_applied_config_revision(
 
 #[cfg(test)]
 mod tests {
-    use easytier::proto::api::manage::{NetworkingMethod, PortForwardConfig};
+    use easytier::proto::api::manage::{
+        CollectNetworkInfoRequest, CollectNetworkInfoResponse, ConfigSource as RpcConfigSource,
+        DeleteNetworkInstanceRequest, DeleteNetworkInstanceResponse, GetNetworkInstanceConfigResponse,
+        ListNetworkInstanceMetaRequest, ListNetworkInstanceMetaResponse, ListNetworkInstanceRequest,
+        ListNetworkInstanceResponse, NetworkingMethod, PortForwardConfig, RetainNetworkInstanceRequest,
+        RetainNetworkInstanceResponse, RunNetworkInstanceRequest, RunNetworkInstanceResponse,
+        ValidateConfigRequest, ValidateConfigResponse, WebClientService,
+    };
+    use easytier::proto::common::Uuid as ProtoUuid;
+    use easytier::proto::rpc_types::error::{Error as RpcError, Result as RpcResult};
+    use crate::db::Db;
 
     use super::*;
+
+    /// Mock device RPC client. `get_network_instance_config` returns a config only
+    /// when `return_config` is set, simulating a device that owns the running
+    /// network. Every other call is unused by `seed_running_device_networks`.
+    struct MockWebClient {
+        return_config: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl WebClientService for MockWebClient {
+        type Controller = BaseController;
+
+        async fn validate_config(
+            &self,
+            _c: BaseController,
+            _i: ValidateConfigRequest,
+        ) -> RpcResult<ValidateConfigResponse> {
+            Err(RpcError::ExecutionError(anyhow::anyhow!("mock")))
+        }
+        async fn run_network_instance(
+            &self,
+            _c: BaseController,
+            _i: RunNetworkInstanceRequest,
+        ) -> RpcResult<RunNetworkInstanceResponse> {
+            Err(RpcError::ExecutionError(anyhow::anyhow!("mock")))
+        }
+        async fn retain_network_instance(
+            &self,
+            _c: BaseController,
+            _i: RetainNetworkInstanceRequest,
+        ) -> RpcResult<RetainNetworkInstanceResponse> {
+            Err(RpcError::ExecutionError(anyhow::anyhow!("mock")))
+        }
+        async fn collect_network_info(
+            &self,
+            _c: BaseController,
+            _i: CollectNetworkInfoRequest,
+        ) -> RpcResult<CollectNetworkInfoResponse> {
+            Err(RpcError::ExecutionError(anyhow::anyhow!("mock")))
+        }
+        async fn list_network_instance(
+            &self,
+            _c: BaseController,
+            _i: ListNetworkInstanceRequest,
+        ) -> RpcResult<ListNetworkInstanceResponse> {
+            Err(RpcError::ExecutionError(anyhow::anyhow!("mock")))
+        }
+        async fn delete_network_instance(
+            &self,
+            _c: BaseController,
+            _i: DeleteNetworkInstanceRequest,
+        ) -> RpcResult<DeleteNetworkInstanceResponse> {
+            Err(RpcError::ExecutionError(anyhow::anyhow!("mock")))
+        }
+        async fn get_network_instance_config(
+            &self,
+            _c: BaseController,
+            _i: GetNetworkInstanceConfigRequest,
+        ) -> RpcResult<GetNetworkInstanceConfigResponse> {
+            if self.return_config {
+                Ok(GetNetworkInstanceConfigResponse {
+                    config: Some(NetworkConfig::default()),
+                    source: RpcConfigSource::User as i32,
+                })
+            } else {
+                Err(RpcError::ExecutionError(anyhow::anyhow!("mock")))
+            }
+        }
+        async fn list_network_instance_meta(
+            &self,
+            _c: BaseController,
+            _i: ListNetworkInstanceMetaRequest,
+        ) -> RpcResult<ListNetworkInstanceMetaResponse> {
+            Err(RpcError::ExecutionError(anyhow::anyhow!("mock")))
+        }
+    }
 
     fn config_with_port_forwards(port_forwards: Vec<PortForwardConfig>) -> NetworkConfig {
         NetworkConfig {
@@ -1521,5 +1618,91 @@ mod tests {
             .plan("managed", desired)
             .expect("prepare action after stale run result");
         assert!(action.is_none());
+    }
+
+    #[tokio::test]
+    async fn seed_skips_web_sourced_running_instance() {
+        let db = Db::memory_db().await;
+        let user = db.auto_create_user("seed-web-skip").await.unwrap();
+        let user_id = user.id;
+        let machine_id = uuid::Uuid::new_v4();
+        let inst_id = uuid::Uuid::new_v4();
+
+        // A web-sourced instance reports as running on the device, but there is no
+        // web row in the DB (it was deleted while offline). The seed path must NOT
+        // resurrect it — that would silently undo an offline delete.
+        let round = ReconcileRound {
+            req: HeartbeatRequest {
+                machine_id: Some(ProtoUuid::from(machine_id)),
+                user_token: "tok".to_string(),
+                ..Default::default()
+            },
+            machine_id,
+            user_id,
+            running_inst_ids: Default::default(),
+            local_configs: vec![],
+            target_config_revision: None,
+            should_apply_runtime_revision: false,
+        };
+        let meta = NetworkMeta {
+            inst_id: Some(ProtoUuid::from(inst_id)),
+            source: RpcConfigSource::Web as i32,
+            ..Default::default()
+        };
+        let mut rpc: Box<dyn WebClientService<Controller = BaseController> + Send> =
+            Box::new(MockWebClient { return_config: false });
+
+        seed_running_device_networks(&db, &mut rpc, &round, &[meta])
+            .await
+            .unwrap();
+
+        assert!(
+            db.get_network_config((user_id, machine_id), &inst_id.to_string())
+                .await
+                .unwrap()
+                .is_none(),
+            "web-sourced running instance must not be resurrected by seed"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_mirrors_user_sourced_running_instance() {
+        let db = Db::memory_db().await;
+        let user = db.auto_create_user("seed-user-mirror").await.unwrap();
+        let user_id = user.id;
+        let machine_id = uuid::Uuid::new_v4();
+        let inst_id = uuid::Uuid::new_v4();
+
+        let round = ReconcileRound {
+            req: HeartbeatRequest {
+                machine_id: Some(ProtoUuid::from(machine_id)),
+                user_token: "tok".to_string(),
+                ..Default::default()
+            },
+            machine_id,
+            user_id,
+            running_inst_ids: Default::default(),
+            local_configs: vec![],
+            target_config_revision: None,
+            should_apply_runtime_revision: false,
+        };
+        let meta = NetworkMeta {
+            inst_id: Some(ProtoUuid::from(inst_id)),
+            source: RpcConfigSource::User as i32,
+            ..Default::default()
+        };
+        let mut rpc: Box<dyn WebClientService<Controller = BaseController> + Send> =
+            Box::new(MockWebClient { return_config: true });
+
+        seed_running_device_networks(&db, &mut rpc, &round, &[meta])
+            .await
+            .unwrap();
+
+        let row = db
+            .get_network_config((user_id, machine_id), &inst_id.to_string())
+            .await
+            .unwrap()
+            .expect("user-sourced running instance must be mirrored into the DB");
+        assert_eq!(row.source, "user");
     }
 }
