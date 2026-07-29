@@ -719,15 +719,12 @@ async fn cleanup_stale_web_source_instances(
         }
     };
 
-    let running_web_inst_ids = managed_config::running_web_source_instance_ids(
-        &round.running_inst_ids,
+    let should_delete_inst_ids = managed_config::compute_stale_web_instance_ids_to_delete(
         &db_web_inst_ids,
+        desired_web_inst_ids,
         running_metas,
+        &round.running_inst_ids,
     );
-    let should_delete_inst_ids = running_web_inst_ids
-        .difference(desired_web_inst_ids)
-        .cloned()
-        .collect::<HashSet<_>>();
     let should_delete_ids =
         managed_config::parse_instance_ids(should_delete_inst_ids.iter().cloned());
 

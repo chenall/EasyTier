@@ -417,6 +417,32 @@ pub(super) fn running_web_source_instance_ids(
     }
 }
 
+/// Computes the set of running web-sourced instance ids that are NO LONGER
+/// desired and therefore must be stopped. This is the decision core of
+/// `cleanup_stale_web_source_instances`: a web instance deleted (or disabled)
+/// while the device was offline is still reported running on reconnect, has no
+/// row in `db_web_inst_ids`, and is absent from `desired_web_inst_ids`, so it is
+/// returned here and the reconcile loop issues `delete_network_instance` for it.
+///
+/// `running_web_source_instance_ids` only counts an instance as web-sourced when
+/// the device reports `source == Web` (modern paths). Legacy devices that do not
+/// report config sources fall back to `running_inst_ids ∩ db_web_inst_ids`, which
+/// cannot detect a deleted web instance — a known limitation (the offline
+/// takeover feature requires `support_config_source`).
+pub(super) fn compute_stale_web_instance_ids_to_delete(
+    db_web_inst_ids: &HashSet<String>,
+    desired_web_inst_ids: &HashSet<String>,
+    running_metas: Option<&[NetworkMeta]>,
+    running_inst_ids: &HashSet<String>,
+) -> HashSet<String> {
+    let running_web =
+        running_web_source_instance_ids(running_inst_ids, db_web_inst_ids, running_metas);
+    running_web
+        .difference(desired_web_inst_ids)
+        .cloned()
+        .collect()
+}
+
 pub(super) fn parse_instance_ids(instance_ids: impl Iterator<Item = String>) -> Vec<RpcUuid> {
     instance_ids
         .filter_map(|inst_id| uuid::Uuid::parse_str(&inst_id).ok())
@@ -1243,6 +1269,72 @@ mod tests {
         assert_eq!(
             PersistedConfigSource::User.auto_run_rpc_source(),
             RpcConfigSource::User
+        );
+    }
+
+    #[test]
+    fn offline_deleted_web_instance_is_stopped_on_reconnect_modern_device() {
+        // Mirrors cleanup_stale_web_source_instances' decision: a web instance
+        // deleted while the device was offline is still reported running with
+        // source=Web on reconnect (support_config_source=true), has no DB row, and
+        // is absent from the desired set -> it must be returned for deletion.
+        let w_id = uuid::Uuid::new_v4();
+        let running_inst_ids: HashSet<String> = HashSet::from([w_id.to_string()]);
+        let db_web_inst_ids: HashSet<String> = HashSet::new(); // deleted from DB
+        let desired_web_inst_ids: HashSet<String> = HashSet::new(); // not desired
+        let metas = vec![NetworkMeta {
+            inst_id: Some(w_id.into()),
+            source: RpcConfigSource::Web as i32,
+            ..Default::default()
+        }];
+        let to_delete = compute_stale_web_instance_ids_to_delete(
+            &db_web_inst_ids,
+            &desired_web_inst_ids,
+            Some(&metas),
+            &running_inst_ids,
+        );
+        assert_eq!(to_delete, HashSet::from([w_id.to_string()]));
+    }
+
+    #[test]
+    fn user_sourced_running_instance_is_never_stopped() {
+        // Device-owned (user-sourced) running instances must never be flagged for
+        // stop — doing so would violate the ownership model.
+        let u_id = uuid::Uuid::new_v4();
+        let metas = vec![NetworkMeta {
+            inst_id: Some(u_id.into()),
+            source: RpcConfigSource::User as i32,
+            ..Default::default()
+        }];
+        let to_delete = compute_stale_web_instance_ids_to_delete(
+            &HashSet::new(),
+            &HashSet::new(),
+            Some(&metas),
+            &HashSet::from([u_id.to_string()]),
+        );
+        assert!(
+            to_delete.is_empty(),
+            "device-owned running instance must not be stopped"
+        );
+    }
+
+    #[test]
+    fn legacy_device_without_config_source_cannot_flag_deleted_web_instance() {
+        // Known limitation: support_config_source=false -> running_metas is None ->
+        // falls back to running_inst_ids ∩ db_web_inst_ids, so a deleted web
+        // instance (no longer in db_web_inst_ids) is NOT detected and keeps running
+        // until device restart. The offline takeover feature requires
+        // support_config_source, so this legacy path is out of scope.
+        let w_id = uuid::Uuid::new_v4();
+        let to_delete = compute_stale_web_instance_ids_to_delete(
+            &HashSet::new(),
+            &HashSet::new(),
+            None,
+            &HashSet::from([w_id.to_string()]),
+        );
+        assert!(
+            to_delete.is_empty(),
+            "legacy path cannot detect deleted web instance without source info"
         );
     }
 }
