@@ -3,9 +3,9 @@ name: EasyTier Core
 on:
   workflow_dispatch:
   push:
-    branches: [ "develop", "main", "releases/**" ]
+    branches: [ "develop","releases/**" ]
   pull_request:
-    branches: [ "develop", "main" ]
+    branches: [ "develop" ]
     types: [ opened, synchronize, reopened, ready_for_review ]
 
 concurrency:
