@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { NetworkTypes, Utils, Api, RemoteManagement } from 'easytier-frontend-lib';
-import { computed } from 'vue';
+import { computed, onMounted, ref } from 'vue';
+import { useI18n } from 'vue-i18n';
 import { useRoute, useRouter } from 'vue-router';
+import { useToast } from 'primevue';
 import ApiClient from '../modules/api';
 
 
@@ -14,6 +16,8 @@ const emits = defineEmits(['update']);
 
 const route = useRoute();
 const router = useRouter();
+const { t } = useI18n();
+const toast = useToast();
 
 const deviceId = computed<string>(() => {
     return route.params.deviceId as string;
@@ -45,11 +49,50 @@ const newConfigGenerator = () => {
     return config;
 }
 
+// 预设网络分组：列出预设并传给 RemoteManagement；"加入预设"由 RemoteManagement
+// 工具栏触发，通过 join-preset 回调把设备加入指定预设（后端幂等，重复加入返回同一实例）。
+const presets = ref<Array<NetworkTypes.PresetSummary>>([]);
+
+const loadPresets = async () => {
+    try {
+        presets.value = await props.api.list_presets();
+    } catch (e) {
+        console.error('Failed to load presets', e);
+    }
+};
+
+const handleJoinPreset = async (presetId: number) => {
+    const preset = presets.value.find((p) => p.id === presetId);
+    try {
+        await props.api.join_preset(presetId, deviceId.value);
+        toast.add({
+            severity: 'success',
+            summary: t('web.common.success'),
+            detail: t('web.preset.join_success', { name: preset?.name ?? '' }),
+            life: 2000,
+        });
+        emits('update');
+    } catch (e: any) {
+        toast.add({
+            severity: 'error',
+            summary: 'Error',
+            detail: JSON.stringify(e?.response?.data ?? e),
+            life: 3000,
+        });
+        throw e;
+    }
+};
+
+onMounted(loadPresets);
+
 </script>
 
 <template>
-    <RemoteManagement :api="remoteClient" v-model:instance-id="selectedInstanceId"
-        :new-config-generator="newConfigGenerator" :device-online="deviceInfo?.online" />
+    <div class="flex flex-col gap-3">
+        <RemoteManagement :api="remoteClient" v-model:instance-id="selectedInstanceId"
+            :new-config-generator="newConfigGenerator" :device-online="deviceInfo?.online" :presets="presets"
+            :join-preset="handleJoinPreset" />
+    </div>
 </template>
 
 <style scoped>

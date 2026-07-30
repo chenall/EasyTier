@@ -145,6 +145,37 @@ export class ApiClient {
         await this.client.put('/auth/password', { new_password: Md5.hashStr(new_password) });
     }
 
+    // Config serialization helpers — pure (machine-independent), so they live on the
+    // global ApiClient and are shared by preset templates as well as per-device networks.
+    async generate_config(config: NetworkTypes.NetworkConfig): Promise<Api.GenerateConfigResponse> {
+        try {
+            const response = await this.client.post<any, GenerateConfigResponse>('/generate-config', {
+                config: NetworkTypes.toBackendNetworkConfig(config)
+            });
+            return response;
+        } catch (error) {
+            if (error instanceof AxiosError) {
+                return { error: error.response?.data };
+            }
+            return { error: 'Unknown error: ' + error };
+        }
+    }
+
+    async parse_config(toml_config: string): Promise<Api.ParseConfigResponse> {
+        try {
+            const response = await this.client.post<any, ParseConfigResponse>('/parse-config', { toml_config });
+            if (response.config) {
+                response.config = NetworkTypes.normalizeNetworkConfig(response.config);
+            }
+            return response;
+        } catch (error) {
+            if (error instanceof AxiosError) {
+                return { error: error.response?.data };
+            }
+            return { error: 'Unknown error: ' + error };
+        }
+    }
+
     public async check_login_status() {
         try {
             await this.client.get('/auth/check_login_status');
@@ -197,6 +228,55 @@ export class ApiClient {
 
     public oidcLoginUrl() {
         return this.client.defaults.baseURL + '/auth/oidc/login';
+    }
+
+    // ---- Preset network groups (global, user-scoped) ----
+
+    public async list_presets(): Promise<Array<NetworkTypes.PresetSummary>> {
+        const response = await this.client.get<any, Array<any>>('/presets');
+        return (response ?? []).map((p) => ({
+            ...p,
+            network_config: NetworkTypes.normalizeNetworkConfig(p.network_config),
+        }));
+    }
+
+    public async create_preset(name: string, config: NetworkTypes.NetworkConfig): Promise<NetworkTypes.PresetSummary> {
+        const response = await this.client.post<any, any>('/presets', {
+            name,
+            network_config: NetworkTypes.toBackendNetworkConfig(config),
+        });
+        return { ...response, network_config: NetworkTypes.normalizeNetworkConfig(response.network_config) };
+    }
+
+    public async update_preset(preset_id: number, name: string, config: NetworkTypes.NetworkConfig): Promise<NetworkTypes.PresetSummary> {
+        const response = await this.client.put<any, any>(`/presets/${preset_id}`, {
+            name,
+            network_config: NetworkTypes.toBackendNetworkConfig(config),
+        });
+        return { ...response, network_config: NetworkTypes.normalizeNetworkConfig(response.network_config) };
+    }
+
+    public async delete_preset(preset_id: number): Promise<undefined> {
+        await this.client.delete<string>(`/presets/${preset_id}`);
+    }
+
+    // Join a device to a preset: the backend builds a fresh network from the
+    // preset template and runs/enables it on the device. Returns the new
+    // instance id.
+    public async join_preset(preset_id: number, machine_id: string): Promise<string> {
+        const response = await this.client.post<any, NetworkTypes.JoinPresetResponse>(
+            `/presets/${preset_id}/devices/${machine_id}`,
+        );
+        return response.instance_id;
+    }
+
+    // Cross-device aggregate of every device network matching the preset.
+    public async get_preset_networks(preset_id: number): Promise<Array<NetworkTypes.PresetNetwork>> {
+        const response = await this.client.get<any, Array<any>>(`/presets/${preset_id}/networks`);
+        return (response ?? []).map((n) => ({
+            ...n,
+            network_config: NetworkTypes.normalizeNetworkConfig(n.network_config),
+        }));
     }
 
     public get_remote_client(machine_id: string): Api.RemoteClient {

@@ -1,7 +1,7 @@
 import './style.css'
 
 import type { App } from 'vue';
-import { Config, Status, ConfigEditDialog, RemoteManagement } from "./components";
+import { Config, Status, ConfigEditDialog, RemoteManagement, PresetNetworkDialog } from "./components";
 import Aura from '@primeuix/themes/aura';
 import PrimeVue from 'primevue/config'
 
@@ -49,4 +49,4 @@ export default {
     }
 };
 
-export { Config, ConfigEditDialog, RemoteManagement, Status, I18nUtils, NetworkTypes, Api, Utils };
+export { Config, ConfigEditDialog, RemoteManagement, Status, I18nUtils, NetworkTypes, Api, Utils, PresetNetworkDialog };

@@ -1,4 +1,5 @@
 import { UUID } from './utils';
+import * as NetworkTypes from '../types/network';
 import { NetworkConfig, NetworkInstanceRunningInfo, VpnPortalInfo } from '../types/network';
 
 export interface ValidateConfigResponse {
@@ -77,4 +78,23 @@ export interface RemoteClient {
     generate_config(config: NetworkConfig): Promise<GenerateConfigResponse>;
     parse_config(toml_config: string): Promise<ParseConfigResponse>;
     get_network_metas(instance_ids: string[]): Promise<GetNetworkMetasResponse>;
+}
+// Global (user-scoped) preset-network-group API. Declared as an interface so the
+// lib components can depend on it without importing the host's ApiClient. The host
+// ApiClient implements these methods structurally.
+export interface PresetClient {
+    list_presets(): Promise<Array<NetworkTypes.PresetSummary>>;
+    create_preset(name: string, config: NetworkTypes.NetworkConfig): Promise<NetworkTypes.PresetSummary>;
+    update_preset(
+        preset_id: number,
+        name: string,
+        config: NetworkTypes.NetworkConfig,
+    ): Promise<NetworkTypes.PresetSummary>;
+    delete_preset(preset_id: number): Promise<undefined>;
+    join_preset(preset_id: number, machine_id: string): Promise<string>;
+    get_preset_networks(preset_id: number): Promise<Array<NetworkTypes.PresetNetwork>>;
+    // Config-file serialization (edit-as-file). Backed by the global
+    // generate_config / parse_config endpoints on the host ApiClient.
+    generate_config(config: NetworkTypes.NetworkConfig): Promise<GenerateConfigResponse>;
+    parse_config(toml_config: string): Promise<ParseConfigResponse>;
 }

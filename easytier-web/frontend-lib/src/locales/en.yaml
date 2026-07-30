@@ -343,6 +343,7 @@ web:
     dashboard: Dashboard
     device_list: Device List
     device_management: Device Management
+    network_groups: Network Groups
     login_page: Login Page
     settings: Settings
     logout: Logout
@@ -413,6 +414,35 @@ web:
     select_existing_network_or_create_new: Select an existing network instance or create a new one to manage network settings
     disable_network: Disable Network
     offline_network_hint: The device is currently offline. Network changes will be pushed automatically when it comes back online.
+
+  preset:
+    title: Preset Network Groups
+    manage: Preset Networks
+    list_empty: No presets yet. Click "Create" in the top right to start.
+    create: Create Preset
+    edit: Edit Preset
+    name: Preset Name
+    name_placeholder: e.g. Office Network
+    name_required: Please enter a preset name
+    config: Network Config
+    saved: Preset saved
+    delete_confirm: Delete preset "{name}"? Devices already in the group are unaffected, but their membership will no longer be maintained automatically.
+    view_group: View Group
+    back_to_group: Back to Group
+    belongs_to: Belongs to preset
+    group_title: Preset Group - {name}
+    group_empty: No device networks match this preset
+    group_device: Device
+    group_instance: Instance
+    group_network: Network
+    group_status: Status
+    group_enabled: Enabled
+    group_disabled: Disabled
+    unknown_network: Unknown network
+    join: Join Preset
+    join_success: Joined preset "{name}"
+    join_failed: Failed to join preset
+    select_preset: Select a preset
 
   network:
     title: Network

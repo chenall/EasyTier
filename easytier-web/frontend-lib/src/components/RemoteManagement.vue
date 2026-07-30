@@ -16,6 +16,13 @@ const props = defineProps<{
     // When false the device is offline: networks can still be added/edited/
     // deleted and will be pushed on the next reconnect. A hint banner is shown.
     deviceOnline?: boolean;
+    // User's preset network groups. When provided, the selected network shows a
+    // "belongs to preset X" badge if its (network_name, network_secret) matches.
+    presets?: NetworkTypes.PresetSummary[];
+    // Optional device→preset join handler. When provided, the toolbar shows a
+    // "join preset" control. The host owns the global ApiClient.join_preset; the
+    // lib only receives a per-device client, so joining is delegated via callback.
+    joinPreset?: (presetId: number) => Promise<void>;
 }>();
 
 const instanceId = defineModel('instanceId', {
@@ -136,9 +143,16 @@ const selectedInstanceId = computed({
     }
 });
 watch(selectedInstanceId, async (newVal, oldVal) => {
-    if (newVal?.uuid !== oldVal?.uuid && (networkIsDisabled.value || networkIsPending.value || networkIsUser.value || isEditingNetwork.value)) {
+    if (newVal?.uuid !== oldVal?.uuid) {
+        // Load the config on every selection so the "belongs to preset" badge
+        // (computed from name + secret) is available in all states, not just
+        // when editing/disabled/user rows.
         await loadCurrentNetworkConfig();
-    } else {
+    }
+
+    if (networkIsDisabled.value || networkIsPending.value || networkIsUser.value || isEditingNetwork.value) {
+        // edit/disabled/user form is driven by currentNetworkConfig (loaded above)
+    } else if (needShowNetworkStatus.value) {
         await loadCurrentNetworkInfo();
     }
 
@@ -146,6 +160,32 @@ watch(selectedInstanceId, async (newVal, oldVal) => {
         await loadNetworkMetas([newVal.uuid]);
     }
 });
+
+// The preset the selected network's (name, secret) matches, if any. Used for the
+// device-side "belongs to preset" badge (requirement #3). Empty/undefined secret
+// is treated as equal so empty-secret presets still match.
+const selectedPreset = computed<NetworkTypes.PresetSummary | undefined>(() => {
+    return NetworkTypes.findMatchingPreset(currentNetworkConfig.value, props.presets ?? []);
+});
+
+// Join-preset control state (only meaningful when the `joinPreset` prop is provided).
+// `presetToJoinId` = the preset the user picked to JOIN (build a new network from);
+// distinct from `selectedPreset` (the preset the *current* network already belongs to).
+const presetToJoinId = ref<number | null>(null);
+const joiningPreset = ref(false);
+const joinSelectedPreset = async () => {
+    if (presetToJoinId.value == null || !props.joinPreset) return;
+    joiningPreset.value = true;
+    try {
+        await props.joinPreset(presetToJoinId.value);
+        presetToJoinId.value = null;
+    } catch {
+        // The host handler owns error surfacing (toast). Swallow here so a host
+        // rethrow doesn't surface as an unhandled promise rejection on the click.
+    } finally {
+        joiningPreset.value = false;
+    }
+};
 
 const networkIsPending = computed(() => {
     if (!selectedInstanceId.value) {
@@ -572,7 +612,9 @@ onUnmounted(() => {
                 </div>
 
                 <!-- 简化的按钮区域 - 无论屏幕大小都显示 -->
-                <div class="flex gap-2 shrink-0 button-container items-center">
+                <div class="flex gap-2 shrink-0 flex-wrap button-container items-center">
+                    <Tag v-if="selectedPreset" :value="t('web.preset.belongs_to') + ': ' + selectedPreset.name"
+                        severity="info" icon="pi pi-bookmark" class="shrink-0" />
                     <!-- Create/Cancel button based on state -->
                     <Button v-if="!isEditingNetwork" @click="newNetwork" icon="pi pi-plus"
                         :label="screenWidth > 640 ? t('web.device_management.create_new') : undefined"
@@ -612,7 +654,7 @@ onUnmounted(() => {
                     <h2 class="text-xl font-medium">{{ t('web.device_management.edit_network') }}</h2>
                 </div>
 
-                <div class="w-full flex gap-2 flex-wrap justify-start mb-3">
+                <div class="w-full flex gap-2 flex-wrap justify-start mb-3 sticky top-0 z-10 bg-surface-0 -mx-4 px-4 py-1">
                     <Button @click="showConfigEditDialog = true" icon="pi pi-file-edit"
                         :label="t('web.device_management.edit_as_file')" iconPos="left" severity="secondary" />
                     <Button @click="importConfig" icon="pi pi-upload" :label="t('web.device_management.import_config')"
@@ -620,6 +662,19 @@ onUnmounted(() => {
                     <Button v-if="networkIsDisabled" @click="saveNetworkConfig" :disabled="!currentNetworkConfig"
                         icon="pi pi-save" :label="t('web.device_management.save_config')" iconPos="left"
                         severity="success" />
+
+                    <!-- Join preset: build a new network from a preset. Hidden when the
+                         current network already belongs to one (requirement #1). The whole
+                         group (divider + select + button) wraps together on narrow screens. -->
+                    <div v-if="joinPreset && !selectedPreset" class="flex items-center gap-2">
+                        <Divider layout="vertical" class="mx-1" />
+                        <Select v-model="presetToJoinId" :options="props.presets ?? []" optionLabel="name"
+                            optionValue="id" :placeholder="t('web.preset.select_preset')" class="min-w-[10rem]" />
+                        <Button :label="screenWidth > 640 ? t('web.preset.join') : undefined"
+                            :class="['create-button', screenWidth <= 640 ? 'p-button-icon-only' : '']"
+                            icon="pi pi-plus" :disabled="presetToJoinId == null" :loading="joiningPreset"
+                            @click="joinSelectedPreset" />
+                    </div>
                 </div>
 
                 <Divider />
@@ -681,8 +736,19 @@ onUnmounted(() => {
 }
 
 .network-content {
-    flex: 1;
+    flex: 1 1 auto;
+    /* Critical for a flex child to actually shrink & let overflow-y kick in
+       (default min-height is auto, which would grow with content and never
+       scroll). */
+    min-height: 0;
     overflow-y: auto;
+    /* The ancestor height chain (MainPage content area -> DeviceManagement ->
+       RemoteManagement) is unbounded, so `flex: 1` alone never gets a bounded
+       height to scroll within. Cap the scroll area to the viewport (minus
+       headroom for the fixed navbar, page padding, preset bar and network
+       selector header) so the save/run buttons at the top/bottom of the edit
+       form stay reachable even when the form is taller than the screen. */
+    max-height: calc(100dvh - 12rem);
 }
 
 /* 按钮样式 */

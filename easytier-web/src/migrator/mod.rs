@@ -6,6 +6,7 @@ mod m20260421_000003_add_network_config_source;
 mod m20260514_000004_rename_web_config_source;
 mod m20260619_000005_managed_config_revisions;
 mod m20260728_000006_device_info_and_tags;
+mod m20260729_000007_preset_network_groups;
 
 pub struct Migrator;
 
@@ -19,6 +20,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260514_000004_rename_web_config_source::Migration),
             Box::new(m20260619_000005_managed_config_revisions::Migration),
             Box::new(m20260728_000006_device_info_and_tags::Migration),
+            Box::new(m20260729_000007_preset_network_groups::Migration),
         ]
     }
 }

@@ -31,7 +31,10 @@ use crate::FeatureFlags;
 use crate::webhook::{ManagedNetworkConfig, SharedWebhookConfig};
 use tokio::task::JoinSet;
 
-use crate::db::{Db, UserIdInDb, entity::user_running_network_configs};
+use crate::db::{
+    Db, UserIdInDb,
+    entity::{preset_network_groups, user_running_network_configs},
+};
 
 pub(crate) use managed_config::ManagedConfigError;
 
@@ -702,6 +705,106 @@ impl ClientManager {
             .map_err(RemoteClientError::PersistentError)
     }
 
+    // ---- Preset network groups: facade over `Db` ----
+    // The DB layer owns the data + the derived-grouping query; these wrappers keep
+    // `Db` behind the `ClientManager` boundary that the REST handlers already use.
+    pub async fn list_presets(
+        &self,
+        user_id: UserIdInDb,
+    ) -> Result<Vec<preset_network_groups::Model>, sea_orm::DbErr> {
+        self.db().list_presets(user_id).await
+    }
+
+    pub async fn get_preset(
+        &self,
+        user_id: UserIdInDb,
+        preset_id: i32,
+    ) -> Result<Option<preset_network_groups::Model>, sea_orm::DbErr> {
+        self.db().get_preset(user_id, preset_id).await
+    }
+
+    pub async fn create_preset(
+        &self,
+        user_id: UserIdInDb,
+        name: &str,
+        network_config: &NetworkConfig,
+    ) -> Result<i32, sea_orm::DbErr> {
+        self.db().create_preset(user_id, name, network_config).await
+    }
+
+    pub async fn update_preset(
+        &self,
+        user_id: UserIdInDb,
+        preset_id: i32,
+        name: &str,
+        network_config: &NetworkConfig,
+    ) -> Result<(), sea_orm::DbErr> {
+        self.db()
+            .update_preset(user_id, preset_id, name, network_config)
+            .await
+    }
+
+    pub async fn delete_preset(
+        &self,
+        user_id: UserIdInDb,
+        preset_id: i32,
+    ) -> Result<(), sea_orm::DbErr> {
+        self.db().delete_preset(user_id, preset_id).await
+    }
+
+    pub async fn list_preset_networks(
+        &self,
+        user_id: UserIdInDb,
+        preset_id: i32,
+    ) -> Result<Vec<user_running_network_configs::Model>, sea_orm::DbErr> {
+        self.db().list_preset_networks(user_id, preset_id).await
+    }
+
+    /// Join a device to a preset: build a fresh network from the preset template
+    /// (new instance id, source = Web) and run/enable it on the device.
+    ///
+    /// Idempotent per device. If the device already has a network whose
+    /// `(network_name, network_secret)` matches the preset template — i.e. it is
+    /// already a member of the group under the *same derived membership* the group
+    /// view uses — no new network is created and the existing instance id is
+    /// returned. This stops a device from accumulating multiple identical networks
+    /// when "join" is clicked repeatedly, which previously produced duplicate rows
+    /// in the group view and runtime anomalies.
+    pub async fn join_preset(
+        &self,
+        user_id: UserIdInDb,
+        preset_id: i32,
+        machine_id: uuid::Uuid,
+    ) -> Result<String, RemoteClientError<sea_orm::DbErr>> {
+        // Guard: is this device already in the preset? Reuse the existing instance
+        // instead of spinning up a duplicate network on the same device.
+        let matched = self
+            .list_preset_networks(user_id, preset_id)
+            .await
+            .map_err(RemoteClientError::PersistentError)?;
+        if let Some(existing) = matched
+            .into_iter()
+            .find(|n| n.device_id == machine_id.to_string())
+        {
+            return Ok(existing.network_instance_id);
+        }
+
+        let preset = self
+            .get_preset(user_id, preset_id)
+            .await
+            .map_err(RemoteClientError::PersistentError)?
+            .ok_or_else(|| RemoteClientError::NotFound("preset not found".to_string()))?;
+        let mut config: NetworkConfig = serde_json::from_str(&preset.network_config)
+            .map_err(|e| RemoteClientError::Other(format!("bad preset config: {e}")))?;
+        // Fresh instance id so the new network never collides with any existing one
+        // (including the instance the preset template itself may have carried).
+        let inst_id = uuid::Uuid::new_v4();
+        config.instance_id = Some(inst_id.to_string());
+        self.run_network_instance_offline_aware((user_id, machine_id), config, true, ConfigSource::Web)
+            .await?;
+        Ok(inst_id.to_string())
+    }
+
     /// Online: delegate to the RPC-backed default (reads running instances
     /// from the device + disabled rows from DB). Offline: nothing is running
     /// on the device, so report stored desired-state rows as enabled (pending
@@ -903,6 +1006,133 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// "Join preset" (PresetApi::handle_join_preset) builds a fresh network from
+    /// the preset template — new instance id, source=Web — then runs/enables it.
+    /// Offline, that must persist an enabled web-sourced desired-state row, and the
+    /// new network must show up in the preset's derived (cross-device) group view.
+    #[tokio::test]
+    async fn join_preset_offline_creates_enabled_web_network_in_group() {
+        let mgr = ClientManager::new(
+            Db::memory_db().await,
+            None,
+            Duration::ZERO,
+            Arc::new(FeatureFlags::default()),
+            Arc::new(crate::webhook::WebhookConfig::new(None, None, None, None, None)),
+        );
+        let user_id = mgr
+            .db()
+            .auto_create_user("join-preset-user")
+            .await
+            .unwrap()
+            .id;
+        // No session => offline branch persists a desired-state row.
+        let machine_id = uuid::Uuid::new_v4();
+
+        let template = NetworkConfig {
+            network_name: Some("preset-net".to_string()),
+            network_secret: Some("preset-secret".to_string()),
+            ..Default::default()
+        };
+        let preset_id = mgr
+            .db()
+            .create_preset(user_id, "group-join", &template)
+            .await
+            .unwrap();
+
+        // Reproduce the handler core: fresh instance id, then run offline-aware.
+        let mut config = template.clone();
+        let inst_id = uuid::Uuid::new_v4();
+        config.instance_id = Some(inst_id.to_string());
+        mgr.run_network_instance_offline_aware((user_id, machine_id), config, true, ConfigSource::Web)
+            .await
+            .unwrap();
+
+        // New network is an enabled, web-sourced row on the device.
+        let rows = mgr
+            .db()
+            .list_network_configs((user_id, machine_id), ListNetworkProps::All)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].network_instance_id, inst_id.to_string());
+        assert_eq!(rows[0].source, "web");
+        assert!(!rows[0].disabled);
+
+        // It appears in the preset's group view (derived key match), tagged with
+        // the device that owns it.
+        let group = mgr
+            .db()
+            .list_preset_networks(user_id, preset_id)
+            .await
+            .unwrap();
+        assert_eq!(group.len(), 1);
+        assert_eq!(group[0].network_instance_id, inst_id.to_string());
+        assert_eq!(group[0].device_id, machine_id.to_string());
+    }
+
+    /// Joining the same preset twice from one device must NOT create a second
+    /// network: the second call returns the existing instance id (idempotent),
+    /// and the group view still shows exactly one network for that device.
+    /// Regression test for the "device can join a preset multiple times" anomaly.
+    #[tokio::test]
+    async fn join_preset_is_idempotent_for_same_device() {
+        let mgr = ClientManager::new(
+            Db::memory_db().await,
+            None,
+            Duration::ZERO,
+            Arc::new(FeatureFlags::default()),
+            Arc::new(crate::webhook::WebhookConfig::new(None, None, None, None, None)),
+        );
+        let user_id = mgr
+            .db()
+            .auto_create_user("join-preset-idem-user")
+            .await
+            .unwrap()
+            .id;
+        let machine_id = uuid::Uuid::new_v4();
+
+        let template = NetworkConfig {
+            network_name: Some("preset-net".to_string()),
+            network_secret: Some("preset-secret".to_string()),
+            ..Default::default()
+        };
+        let preset_id = mgr
+            .db()
+            .create_preset(user_id, "group-idem", &template)
+            .await
+            .unwrap();
+
+        let inst1 = mgr
+            .join_preset(user_id, preset_id, machine_id)
+            .await
+            .expect("first join should succeed");
+        let inst2 = mgr
+            .join_preset(user_id, preset_id, machine_id)
+            .await
+            .expect("second join should be idempotent, not error");
+
+        assert_eq!(
+            inst1, inst2,
+            "joining the same preset twice must return the same instance id"
+        );
+
+        // Exactly one network for this device in the preset group (no duplicate).
+        let group = mgr
+            .db()
+            .list_preset_networks(user_id, preset_id)
+            .await
+            .unwrap();
+        let on_device: Vec<_> = group
+            .iter()
+            .filter(|n| n.device_id == machine_id.to_string())
+            .collect();
+        assert_eq!(
+            on_device.len(),
+            1,
+            "device must not accumulate duplicate networks for the same preset"
         );
     }
 

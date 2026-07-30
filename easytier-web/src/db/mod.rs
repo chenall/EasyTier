@@ -3,8 +3,8 @@
 pub mod entity;
 
 use easytier::common::config::{ConfigSource, NetworkConfig};
-use easytier_core::management::remote_client::{ListNetworkProps, Storage};
-use entity::user_running_network_configs;
+use easytier_core::management::remote_client::{ListNetworkProps, PersistentConfig, Storage};
+use entity::{preset_network_groups, user_running_network_configs};
 use sea_orm::{
     ColumnTrait as _, DatabaseConnection, DbErr, EntityTrait, QueryFilter as _, Set,
     SqlxSqliteConnector, TransactionTrait as _, sea_query::OnConflict,
@@ -909,6 +909,191 @@ impl Storage<(UserIdInDb, Uuid), user_running_network_configs::Model, DbErr> for
     }
 }
 
+impl Db {
+    // ---- Preset network groups (Task 2) ----
+    // A preset is a saved NetworkConfig template scoped to a user. The "group" is
+    // derived at read time by matching a device network's (network_name,
+    // network_secret) against the preset's template — no join table is stored.
+
+    pub async fn create_preset(
+        &self,
+        user_id: UserIdInDb,
+        name: &str,
+        network_config: &NetworkConfig,
+    ) -> Result<i32, DbErr> {
+        let network_config =
+            serde_json::to_string(network_config).map_err(|e| DbErr::Json(e.to_string()))?;
+
+        // The UNIQUE(user_id, name) index is the source of truth for the name
+        // clash. We check first so we can return a clear error; the index remains
+        // the hard guard against any race.
+        if preset_network_groups::Entity::find()
+            .filter(preset_network_groups::Column::UserId.eq(user_id))
+            .filter(preset_network_groups::Column::Name.eq(name))
+            .one(self.orm_db())
+            .await?
+            .is_some()
+        {
+            return Err(DbErr::Custom(
+                "preset name already exists for this user".to_string(),
+            ));
+        }
+
+        let now = chrono::Local::now().fixed_offset();
+        let insert = preset_network_groups::ActiveModel {
+            user_id: Set(user_id),
+            name: Set(name.to_string()),
+            network_config: Set(network_config),
+            create_time: Set(now),
+            update_time: Set(now),
+            ..Default::default()
+        };
+        preset_network_groups::Entity::insert(insert)
+            .exec(self.orm_db())
+            .await?;
+
+        let model = preset_network_groups::Entity::find()
+            .filter(preset_network_groups::Column::UserId.eq(user_id))
+            .filter(preset_network_groups::Column::Name.eq(name))
+            .one(self.orm_db())
+            .await?
+            .ok_or_else(|| DbErr::Custom("preset not found after insert".to_string()))?;
+        Ok(model.id)
+    }
+
+    pub async fn list_presets(
+        &self,
+        user_id: UserIdInDb,
+    ) -> Result<Vec<preset_network_groups::Model>, DbErr> {
+        preset_network_groups::Entity::find()
+            .filter(preset_network_groups::Column::UserId.eq(user_id))
+            .all(self.orm_db())
+            .await
+    }
+
+    pub async fn get_preset(
+        &self,
+        user_id: UserIdInDb,
+        preset_id: i32,
+    ) -> Result<Option<preset_network_groups::Model>, DbErr> {
+        preset_network_groups::Entity::find_by_id(preset_id)
+            .filter(preset_network_groups::Column::UserId.eq(user_id))
+            .one(self.orm_db())
+            .await
+    }
+
+    pub async fn update_preset(
+        &self,
+        user_id: UserIdInDb,
+        preset_id: i32,
+        name: &str,
+        network_config: &NetworkConfig,
+    ) -> Result<(), DbErr> {
+        // name-uniqueness guard (exclude self); mirrors create_preset
+        let name_taken = preset_network_groups::Entity::find()
+            .filter(preset_network_groups::Column::UserId.eq(user_id))
+            .filter(preset_network_groups::Column::Name.eq(name))
+            .filter(preset_network_groups::Column::Id.ne(preset_id))
+            .one(self.orm_db())
+            .await?
+            .is_some();
+        if name_taken {
+            return Err(DbErr::Custom(
+                "preset name already exists for this user".to_string(),
+            ));
+        }
+
+        let network_config =
+            serde_json::to_string(network_config).map_err(|e| DbErr::Json(e.to_string()))?;
+        let result = preset_network_groups::Entity::update_many()
+            .filter(preset_network_groups::Column::UserId.eq(user_id))
+            .filter(preset_network_groups::Column::Id.eq(preset_id))
+            .col_expr(
+                preset_network_groups::Column::Name,
+                Expr::value(name),
+            )
+            .col_expr(
+                preset_network_groups::Column::NetworkConfig,
+                Expr::value(network_config),
+            )
+            .col_expr(
+                preset_network_groups::Column::UpdateTime,
+                Expr::value(chrono::Local::now().fixed_offset()),
+            )
+            .exec(self.orm_db())
+            .await?;
+        if result.rows_affected == 0 {
+            return Err(DbErr::Custom("preset not found".to_string()));
+        }
+        Ok(())
+    }
+
+    pub async fn delete_preset(
+        &self,
+        user_id: UserIdInDb,
+        preset_id: i32,
+    ) -> Result<(), DbErr> {
+        preset_network_groups::Entity::delete_many()
+            .filter(preset_network_groups::Column::UserId.eq(user_id))
+            .filter(preset_network_groups::Column::Id.eq(preset_id))
+            .exec(self.orm_db())
+            .await?;
+        Ok(())
+    }
+
+    /// Cross-device aggregate of all device networks belonging to a preset.
+    /// "Belonging" is derived: a device network matches the preset when its
+    /// `(network_name, network_secret)` equals the preset template's. Because the
+    /// group is computed here, deleting a device network (or editing it so the key
+    /// no longer matches) automatically removes it from the group — there is no
+    /// denormalized membership to keep in sync.
+    pub async fn list_preset_networks(
+        &self,
+        user_id: UserIdInDb,
+        preset_id: i32,
+    ) -> Result<Vec<user_running_network_configs::Model>, DbErr> {
+        let preset = self
+            .get_preset(user_id, preset_id)
+            .await?
+            .ok_or_else(|| DbErr::Custom("preset not found".to_string()))?;
+        let preset_cfg: NetworkConfig = serde_json::from_str(&preset.network_config)
+            .map_err(|e| DbErr::Json(e.to_string()))?;
+
+        let rows = user_running_network_configs::Entity::find()
+            .filter(user_running_network_configs::Column::UserId.eq(user_id))
+            .all(self.orm_db())
+            .await?;
+
+        let mut matched = Vec::new();
+        for row in rows {
+            if let Ok(cfg) = row.get_network_config() {
+                if preset_network_key_matches(&cfg, &preset_cfg) {
+                    matched.push(row);
+                }
+            }
+        }
+        Ok(matched)
+    }
+}
+
+/// True when two network configs share the same network identity: equal
+/// `network_name` and equal `network_secret`. `None`/empty are treated as equal
+/// so an empty-secret preset still groups empty-secret device networks. This is
+/// the single definition of "same network" used for preset grouping.
+pub fn preset_network_key_matches(cfg: &NetworkConfig, preset: &NetworkConfig) -> bool {
+    let name_eq = cfg
+        .network_name
+        .as_deref()
+        .unwrap_or("")
+        == preset.network_name.as_deref().unwrap_or("");
+    let secret_eq = cfg
+        .network_secret
+        .as_deref()
+        .unwrap_or("")
+        == preset.network_secret.as_deref().unwrap_or("");
+    name_eq && secret_eq
+}
+
 #[cfg(test)]
 mod tests {
     use easytier::{common::config::ConfigSource, proto::api::manage::NetworkConfig};
@@ -1296,5 +1481,156 @@ mod tests {
                 .as_deref(),
             Some("rev-user")
         );
+    }
+
+    #[tokio::test]
+    async fn test_preset_crud_and_derived_grouping() {
+        let db = Db::memory_db().await;
+        let user_id = db.auto_create_user("preset-user").await.unwrap().id;
+        let device_id = uuid::Uuid::new_v4();
+
+        let preset_cfg = NetworkConfig {
+            network_name: Some("net-a".to_string()),
+            network_secret: Some("secret-a".to_string()),
+            ..Default::default()
+        };
+
+        // create + unique-name guard
+        let id = db
+            .create_preset(user_id, "group-a", &preset_cfg)
+            .await
+            .unwrap();
+        let dup = db.create_preset(user_id, "group-a", &preset_cfg).await;
+        assert!(dup.is_err(), "duplicate preset name must be rejected");
+
+        // list / get
+        let listed = db.list_presets(user_id).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            db.get_preset(user_id, id).await.unwrap().unwrap().name,
+            "group-a"
+        );
+
+        // update
+        let updated_cfg = NetworkConfig {
+            network_name: Some("net-a".to_string()),
+            network_secret: Some("secret-a".to_string()),
+            virtual_ipv4: Some("10.0.0.1".to_string()),
+            ..Default::default()
+        };
+        db.update_preset(user_id, id, "group-a-renamed", &updated_cfg)
+            .await
+            .unwrap();
+        let preset = db.get_preset(user_id, id).await.unwrap().unwrap();
+        assert_eq!(preset.name, "group-a-renamed");
+        let parsed: NetworkConfig = serde_json::from_str(&preset.network_config).unwrap();
+        assert_eq!(parsed.virtual_ipv4.as_deref(), Some("10.0.0.1"));
+
+        // update missing -> err
+        assert!(db
+            .update_preset(user_id, 99999, "x", &updated_cfg)
+            .await
+            .is_err());
+
+        // key matching helper
+        let same = NetworkConfig {
+            network_name: Some("net-a".to_string()),
+            network_secret: Some("secret-a".to_string()),
+            ..Default::default()
+        };
+        let diff_secret = NetworkConfig {
+            network_name: Some("net-a".to_string()),
+            network_secret: Some("other".to_string()),
+            ..Default::default()
+        };
+        let diff_name = NetworkConfig {
+            network_name: Some("net-b".to_string()),
+            network_secret: Some("secret-a".to_string()),
+            ..Default::default()
+        };
+        assert!(crate::db::preset_network_key_matches(
+            &same,
+            &preset_cfg
+        ));
+        assert!(!crate::db::preset_network_key_matches(
+            &diff_secret,
+            &preset_cfg
+        ));
+        assert!(!crate::db::preset_network_key_matches(
+            &diff_name,
+            &preset_cfg
+        ));
+        // empty secret matches empty secret
+        let empty_a = NetworkConfig {
+            network_name: Some("net-x".to_string()),
+            network_secret: None,
+            ..Default::default()
+        };
+        let empty_b = NetworkConfig {
+            network_name: Some("net-x".to_string()),
+            network_secret: Some("".to_string()),
+            ..Default::default()
+        };
+        assert!(crate::db::preset_network_key_matches(
+            &empty_a,
+            &empty_b
+        ));
+
+        // seed device networks across the user's device
+        let inst_match = uuid::Uuid::new_v4();
+        db.insert_or_update_user_network_config(
+            (user_id, device_id),
+            inst_match,
+            same.clone(),
+            ConfigSource::User,
+        )
+        .await
+        .unwrap();
+        let inst_mismatch = uuid::Uuid::new_v4();
+        db.insert_or_update_user_network_config(
+            (user_id, device_id),
+            inst_mismatch,
+            diff_secret.clone(),
+            ConfigSource::User,
+        )
+        .await
+        .unwrap();
+        // a matching but DISABLED network must still appear in the group view
+        let inst_disabled = uuid::Uuid::new_v4();
+        db.insert_or_update_user_network_config(
+            (user_id, device_id),
+            inst_disabled,
+            same.clone(),
+            ConfigSource::User,
+        )
+        .await
+        .unwrap();
+        db.update_web_network_config_state((user_id, device_id), inst_disabled, true)
+            .await
+            .unwrap();
+
+        // derived grouping: only the two matching rows (enabled + disabled) appear
+        let group = db.list_preset_networks(user_id, id).await.unwrap();
+        let ids: std::collections::HashSet<_> =
+            group.iter().map(|m| m.network_instance_id.clone()).collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&inst_match.to_string()));
+        assert!(ids.contains(&inst_disabled.to_string()));
+        assert!(!ids.contains(&inst_mismatch.to_string()));
+
+        // deleting the device network auto-removes it from the group (derived)
+        db.delete_network_configs((user_id, device_id), &[inst_match])
+            .await
+            .unwrap();
+        let group_after = db.list_preset_networks(user_id, id).await.unwrap();
+        assert_eq!(group_after.len(), 1);
+        assert_eq!(
+            group_after[0].network_instance_id,
+            inst_disabled.to_string()
+        );
+
+        // delete preset
+        db.delete_preset(user_id, id).await.unwrap();
+        assert!(db.get_preset(user_id, id).await.unwrap().is_none());
     }
 }

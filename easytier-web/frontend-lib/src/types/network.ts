@@ -480,6 +480,63 @@ export interface CommonUuid {
   part4?: number
 }
 
+// 预设网络分组（Preset Network Groups）
+//
+// 一个 preset 是某张网络的公共配置模板；分组在读取时派生：某设备网络若其
+// (network_name, network_secret) 与 preset 模板一致，即归入该分组。这里只定义
+// 前后端共享的数据类型，具体 API 见 host 的 ApiClient（preset 是用户级全局资源，
+// 不是 per-machine 资源，因此不挂在 RemoteClient 接口上）。
+
+export interface PresetSummary {
+  id: number
+  name: string
+  network_config: NetworkConfig
+  create_time: string
+  update_time: string
+}
+
+export interface PresetNetwork {
+  device_id: string
+  instance_id: string
+  source: string
+  disabled: boolean
+  network_config: NetworkConfig
+}
+
+export interface PresetRequest {
+  name: string
+  network_config: NetworkConfig
+}
+
+export interface JoinPresetResponse {
+  instance_id: string
+}
+
+// True when a device network config belongs to a preset: its (network_name,
+// network_secret) equals the preset template's. Empty string and undefined are
+// treated as equal so an empty-secret preset still groups empty-secret networks.
+// This mirrors the backend `preset_network_key_matches` and is used for the
+// device-side "belongs to preset" badge.
+export function networkConfigMatchesPreset(
+  config: NetworkConfig | undefined,
+  preset: PresetSummary,
+): boolean {
+  if (!config) {
+    return false
+  }
+  const nameEq = (config.network_name ?? '') === (preset.network_config.network_name ?? '')
+  const secretEq = (config.network_secret ?? '') === (preset.network_config.network_secret ?? '')
+  return nameEq && secretEq
+}
+
+// Returns the first preset (by id) the config matches, or undefined.
+export function findMatchingPreset(
+  config: NetworkConfig | undefined,
+  presets: PresetSummary[],
+): PresetSummary | undefined {
+  return presets.find((p) => networkConfigMatchesPreset(config, p))
+}
+
 // 添加新行
 export const addRow = (rows: PortForwardConfig[]) => {
   rows.push({

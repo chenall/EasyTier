@@ -343,6 +343,7 @@ web:
     dashboard: 仪表盘
     device_list: 设备列表
     device_management: 设备管理
+    network_groups: 网络分组
     login_page: 登录页面
     settings: 设置
     logout: 退出登录
@@ -413,6 +414,35 @@ web:
     select_existing_network_or_create_new: 选择现有网络实例或创建新网络以管理网络设置
     disable_network: 禁用网络
     offline_network_hint: 设备当前离线，网络变更将在设备下次上线后自动下发
+
+  preset:
+    title: 预设网络分组
+    manage: 预设网络
+    list_empty: 暂无预设，点击右上角“新建预设”开始
+    create: 新建预设
+    edit: 编辑预设
+    name: 预设名称
+    name_placeholder: 例如：办公网络
+    name_required: 请填写预设名称
+    config: 网络配置
+    saved: 预设已保存
+    delete_confirm: 确定删除预设 “{name}” 吗？已加入该分组的设备不会受影响，但其在分组中的归属将不再自动维护。
+    view_group: 查看分组
+    back_to_group: 返回分组
+    belongs_to: 属于预设
+    group_title: 预设分组：{name}
+    group_empty: 暂无设备网络匹配该预设
+    group_device: 设备
+    group_instance: 实例
+    group_network: 网络
+    group_status: 状态
+    group_enabled: 已启用
+    group_disabled: 已禁用
+    unknown_network: 未知网络
+    join: 加入预设
+    join_success: 已加入预设 “{name}”
+    join_failed: 加入预设失败
+    select_preset: 选择预设
 
   network:
     title: 网络

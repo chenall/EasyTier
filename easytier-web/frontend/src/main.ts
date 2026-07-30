@@ -14,6 +14,7 @@ import Login from './components/Login.vue'
 import DeviceList from './components/DeviceList.vue'
 import DeviceManagement from './components/DeviceManagement.vue'
 import Dashboard from './components/Dashboard.vue'
+import NetworkGroups from './components/NetworkGroups.vue'
 import DialogService from 'primevue/dialogservice';
 import ToastService from 'primevue/toastservice';
 
@@ -51,6 +52,23 @@ const routes = [
                     {
                         path: 'device/:deviceId/:instanceId?',
                         name: 'deviceManagement',
+                        component: DeviceManagement,
+                    }
+                ]
+            },
+            {
+                path: 'networkGroups',
+                name: 'networkGroups',
+                component: NetworkGroups,
+            },
+            {
+                path: 'networkGroups/:groupId/devices',
+                name: 'networkGroupDevices',
+                component: DeviceList,
+                children: [
+                    {
+                        path: 'device/:deviceId/:instanceId?',
+                        name: 'groupDeviceManagement',
                         component: DeviceManagement,
                     }
                 ]

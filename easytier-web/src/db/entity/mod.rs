@@ -12,3 +12,4 @@ pub mod users;
 pub mod users_groups;
 pub mod device_info;
 pub mod device_tags;
+pub mod preset_network_groups;

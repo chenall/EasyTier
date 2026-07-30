@@ -10,3 +10,4 @@ pub use super::users::Entity as Users;
 pub use super::users_groups::Entity as UsersGroups;
 pub use super::device_info::Entity as DeviceInfo;
 pub use super::device_tags::Entity as DeviceTags;
+pub use super::preset_network_groups::Entity as PresetNetworkGroups;

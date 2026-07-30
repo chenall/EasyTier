@@ -16,7 +16,7 @@ declare const window: Window & typeof globalThis;
 const vTooltip = Tooltip;
 
 const props = defineProps({
-    api: ApiClient,
+    api: { type: ApiClient, required: true },
 });
 
 const detailPopover = ref();
@@ -38,6 +38,46 @@ const selectedDeviceId = computed<string | undefined>(() => route.params.deviceI
 const route = useRoute();
 const router = useRouter();
 const toast = useToast();
+
+// Network group scoping: when mounted under a network group route, only show
+// the devices assigned to that group. Same component, same management features.
+const groupId = computed(() => route.params.groupId as string | undefined);
+const groupDeviceIds = ref<Set<string> | null>(null);
+const groupName = ref('');
+// machine_id -> network_instance_id for this group, so we can open the device
+// directly on its group network instance.
+const groupDeviceInstanceIds = ref<Map<string, string>>(new Map());
+
+async function loadPresetScope() {
+    if (!groupId.value) {
+        groupDeviceIds.value = null;
+        groupName.value = '';
+        groupDeviceInstanceIds.value = new Map();
+        return;
+    }
+    const id = Number(groupId.value);
+    if (Number.isNaN(id)) {
+        groupDeviceIds.value = new Set();
+        groupName.value = '';
+        groupDeviceInstanceIds.value = new Map();
+        return;
+    }
+    try {
+        const networks = await api.get_preset_networks(id);
+        groupDeviceIds.value = new Set((networks || []).map((n) => n.device_id));
+        groupDeviceInstanceIds.value = new Map((networks || []).map((n) => [n.device_id, n.instance_id]));
+    } catch (e) {
+        console.error('Failed to load preset networks', e);
+        groupDeviceIds.value = new Set();
+        groupDeviceInstanceIds.value = new Map();
+    }
+    try {
+        const presets = await api.list_presets();
+        groupName.value = presets.find((p) => p.id === id)?.name || '';
+    } catch (e) {
+        console.error('Failed to load preset info', e);
+    }
+}
 
 const loadDevices = async () => {
     const resp = await api?.list_machines();
@@ -63,6 +103,12 @@ onMounted(async () => {
     // 初始化屏幕尺寸相关变量
     handleResize();
     window.addEventListener('resize', handleResize);
+    await loadPresetScope();
+});
+
+// 切换分组时重新加载设备范围
+watch(groupId, () => {
+    loadPresetScope();
 });
 
 onUnmounted(() => {
@@ -74,7 +120,13 @@ const deviceManageVisible = computed<boolean>({
     get: () => !!selectedDeviceId.value,
     set: (value) => {
         if (!value) {
-            router.push({ name: 'deviceList', params: { deviceId: undefined } });
+            // Return to the correct parent list. When the device was opened from a
+            // network group, route back to that group's device list; otherwise the top list.
+            if (route.params.groupId) {
+                router.push({ name: 'networkGroupDevices', params: { groupId: route.params.groupId } });
+            } else {
+                router.push({ name: 'deviceList', params: { deviceId: undefined } });
+            }
         }
     }
 });
@@ -83,11 +135,18 @@ const selectedDeviceHostname = computed<string | undefined>(() => {
     return deviceList.value?.find((device) => device.machine_id === selectedDeviceId.value)?.hostname;
 });
 
+// In group mode, open the device directly on this group's network instance; elsewhere use the
+// device's first running instance.
+const manageRouteName = computed(() => route.name === 'networkGroupDevices' ? 'groupDeviceManagement' : 'deviceManagement');
+
 // 处理设备管理
 const handleDeviceManagement = (device: Utils.DeviceInfo) => {
-    const instanceId = device.running_network_instances?.[0];
+    let instanceId = device.running_network_instances?.[0];
+    if (groupId.value && groupDeviceInstanceIds.value.has(device.machine_id)) {
+        instanceId = groupDeviceInstanceIds.value.get(device.machine_id);
+    }
     router.push({
-        name: 'deviceManagement',
+        name: manageRouteName.value,
         params: {
             deviceId: device.machine_id,
             instanceId: instanceId
@@ -178,7 +237,10 @@ const availableTags = computed<Array<{ name: string; value: string }>>(() => {
 const selectedTags = ref<Array<string>>([]);
 
 const filteredDeviceList = computed<Array<Utils.DeviceInfo> | undefined>(() => {
-    const list = sortedDeviceList.value;
+    let list = sortedDeviceList.value;
+    if (list && groupDeviceIds.value) {
+        list = list.filter((d) => groupDeviceIds.value!.has(d.machine_id));
+    }
     if (!list || selectedTags.value.length === 0) return list;
     return list.filter((d) => (d.tags ?? []).some((t) => selectedTags.value.includes(t)));
 });
@@ -786,8 +848,13 @@ const handleResize = () => {
 <template>
     <div class="flex flex-col gap-4">
         <!-- 标题和工具栏 -->
-        <div class="text-xl font-bold">
-            <h1>{{ t('web.device.list') }}</h1>
+        <div class="flex items-center justify-between">
+            <div class="text-xl font-bold">
+                <h1 v-if="!groupId">{{ t('web.device.list') }}</h1>
+                <h1 v-else>{{ t('web.preset.group_title', { name: groupName }) }}</h1>
+            </div>
+            <Button v-if="groupId" :label="t('web.preset.back_to_group')" icon="pi pi-arrow-left"
+                severity="secondary" text @click="router.push({ name: 'networkGroups' })" />
         </div>
 
         <Toolbar class="mb-4 p-3 gap-4 surface-0 border-1 surface-border rounded-md">
@@ -823,7 +890,6 @@ const handleResize = () => {
             </template>
             <template #end>
                 <div class="flex items-center gap-3">
-                    <div class="hidden sm:block border-r-1 surface-border h-4 mr-2"></div>
                     <div class="flex items-center gap-2">
                         <label for="detailed-view" class="text-sm text-500 hidden sm:block">{{
                             t('web.device.show_detailed_view') }}</label>

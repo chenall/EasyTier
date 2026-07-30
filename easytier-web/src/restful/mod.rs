@@ -1,6 +1,7 @@
 mod auth;
 pub(crate) mod captcha;
 mod network;
+mod preset;
 pub(crate) mod oidc;
 mod rpc;
 mod users;
@@ -19,6 +20,7 @@ use axum_messages::MessagesManagerLayer;
 use easytier::common::config::{ConfigLoader, NetworkConfig, NetworkConfigExt, TomlConfigLoader};
 use easytier::proto::rpc_types;
 use network::NetworkApi;
+use preset::PresetApi;
 use sea_orm::DbErr;
 use tokio::net::TcpListener;
 use tokio_util::task::AbortOnDropHandle;
@@ -271,6 +273,7 @@ impl RestfulServer {
             .route("/api/v1/summary", get(Self::handle_get_summary))
             .route("/api/v1/sessions", get(Self::handle_list_all_sessions))
             .merge(NetworkApi::build_route())
+            .merge(PresetApi::build_route())
             .merge(rpc::router())
             .route_layer(login_required!(Backend))
             .merge(auth::router().layer(Extension(self.feature_flags.clone())))
