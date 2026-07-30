@@ -4,7 +4,7 @@ import { NetworkInstance, VpnPortalClientState, type TunnelInfo, type NodeInfo, 
 import type { RemoteClient } from '../modules/api'
 import { useI18n } from 'vue-i18n';
 import { computed, onMounted, onUnmounted, ref } from 'vue';
-import { ipv4InetToString, ipv4ToString, ipv6ToString } from '../modules/utils';
+import { ipv4InetToString, ipv4ToString, ipv6ToString, type DeviceInfo } from '../modules/utils';
 import { latencyMs, lossRate, numericValue, peerConns } from '../modules/statusDisplay';
 import { Badge, DataTable, Column, Tag, Chip, Button, Dialog, ScrollPanel, Timeline, Divider, Card, } from 'primevue';
 import NetworkChart from './NetworkChart.vue';
@@ -12,7 +12,28 @@ import NetworkChart from './NetworkChart.vue';
 const props = defineProps<{
   curNetworkInst: NetworkInstance | null,
   api: RemoteClient,
+  // 设备列表（含 alias）。用于在网络状态的对端主机名上 hover 时显示别名。
+  // 通过 DeviceManagement → RemoteManagement 透传下来；未提供时 tooltip 退化为 hostname。
+  deviceList?: Array<DeviceInfo>,
 }>()
+
+// hostname → alias 映射。对端（peer）只暴露 hostname，没有 machine_id/peer_id，
+// 因此用 hostname 匹配已注册设备的别名。两台设备 hostname 相同时取第一个（tooltip 属锦上添花，可接受）。
+const hostnameToAlias = computed<Map<string, string>>(() => {
+  const map = new Map<string, string>()
+  for (const device of props.deviceList ?? []) {
+    if (device.alias) {
+      map.set(device.hostname, device.alias)
+    }
+  }
+  return map
+})
+
+// 有别名则只显示别名（方案 A），否则回退到 hostname（保持原行为）。
+function aliasTooltip(hostname: string | undefined): string {
+  if (!hostname) return ''
+  return hostnameToAlias.value.get(hostname) ?? hostname
+}
 
 const { t } = useI18n()
 
@@ -533,11 +554,11 @@ function showEventLogs() {
             <Column :header="t('hostname')">
               <template #body="slotProps">
                 <div v-if="!slotProps.data.route.cost || !isPublicServerRoute(slotProps.data)"
-                  v-tooltip="slotProps.data.route.hostname">
+                  v-tooltip="aliasTooltip(slotProps.data.route.hostname)">
                   {{
                     slotProps.data.route.hostname }}
                 </div>
-                <div v-else v-tooltip="slotProps.data.route.hostname" class="space-x-1">
+                <div v-else v-tooltip="aliasTooltip(slotProps.data.route.hostname)" class="space-x-1">
                   <Tag v-if="isPublicServerRoute(slotProps.data)" severity="info" value="Info">
                     {{ t('status.server') }}
                   </Tag>

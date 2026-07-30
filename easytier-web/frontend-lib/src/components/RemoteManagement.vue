@@ -23,6 +23,8 @@ const props = defineProps<{
     // "join preset" control. The host owns the global ApiClient.join_preset; the
     // lib only receives a per-device client, so joining is delegated via callback.
     joinPreset?: (presetId: number) => Promise<void>;
+    // 设备列表（含 alias）。透传给 Status，用于在对端主机名 hover 时显示别名。
+    deviceList?: Array<Utils.DeviceInfo>;
 }>();
 
 const instanceId = defineModel('instanceId', {
@@ -692,7 +694,7 @@ onUnmounted(() => {
 
                 <Status v-if="curNetworkInfo && curNetworkInfo.error_msg === ''" v-bind:cur-network-inst="curNetworkInfo"
                     :api="api"
-                    class="mb-4">
+                    :device-list="deviceList" class="mb-4">
                 </Status>
                 <Message v-else-if="curNetworkInfo?.error_msg" severity="error" class="mb-4">{{
                     curNetworkInfo.error_msg }}</Message>

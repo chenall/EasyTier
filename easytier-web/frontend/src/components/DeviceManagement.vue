@@ -91,7 +91,7 @@ onMounted(loadPresets);
     <div class="flex flex-col gap-3">
         <RemoteManagement :api="remoteClient" v-model:instance-id="selectedInstanceId"
             :new-config-generator="newConfigGenerator" :device-online="deviceInfo?.online" :presets="presets"
-            :join-preset="handleJoinPreset" />
+            :join-preset="handleJoinPreset" :device-list="deviceList" />
     </div>
 </template>
 
