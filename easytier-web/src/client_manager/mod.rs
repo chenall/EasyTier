@@ -113,10 +113,13 @@ impl ClientManager {
         }
     }
 
-    pub async fn add_listener<L: SocketListener<Accepted = Box<dyn Tunnel>> + 'static>(
+    pub async fn add_listener(
         &mut self,
-        mut listener: L,
+        make_listener: impl Fn() -> anyhow::Result<Box<dyn SocketListener<Accepted = Box<dyn Tunnel>>>>
+            + Send
+            + 'static,
     ) -> Result<url::Url, anyhow::Error> {
+        let mut listener = make_listener()?;
         listener.listen().await?;
         let local_url = listener.local_url();
         self.listeners_cnt.fetch_add(1, Ordering::Relaxed);
@@ -129,42 +132,95 @@ impl ClientManager {
         let feature_flags = self.feature_flags.clone();
         let webhook_config = self.webhook_config.clone();
         self.tasks.spawn(async move {
-            while let Ok(tunnel) = listener.accept().await {
-                let (tunnel, secure) = match web_security::accept_or_upgrade_server_tunnel(
-                    tunnel,
-                )
-                .await
-                {
-                    Ok(v) => v,
-                    Err(error) => {
-                        tracing::warn!(%error, "failed to accept secure tunnel, dropping connection");
-                        continue;
+            let mut listener = listener;
+            let mut restart_backoff = Duration::from_secs(1);
+            loop {
+                loop {
+                    match listener.accept().await {
+                        Ok(tunnel) => {
+                            let (tunnel, secure) =
+                                match web_security::accept_or_upgrade_server_tunnel(tunnel).await {
+                                    Ok(v) => v,
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            %error,
+                                            "failed to accept secure tunnel, dropping connection"
+                                        );
+                                        continue;
+                                    }
+                                };
+                            let info = tunnel.info().unwrap();
+                            let client_url: url::Url = info.remote_addr.unwrap().into();
+                            let location = Self::lookup_location(&client_url, geoip_db.clone());
+                            tracing::info!(
+                                "New session from {:?}, secure: {}, location: {:?}",
+                                client_url,
+                                secure,
+                                location
+                            );
+                            let mut session = Session::new(
+                                storage.clone(),
+                                client_url.clone(),
+                                location,
+                                heartbeat_min_response_delay,
+                                feature_flags.clone(),
+                                webhook_config.clone(),
+                                next_session_epoch.fetch_add(1, Ordering::Relaxed) + 1,
+                            );
+                            session.serve(tunnel).await;
+                            let session = Arc::new(session);
+                            sessions.insert(client_url, session.clone());
+                            session.mark_route_ready();
+                        }
+                        Err(error) => {
+                            // A single transient socket/listener error must never
+                            // kill this listener permanently: that would drop every
+                            // client on it and leave them unable to reconnect until
+                            // the whole server is restarted. Recreate the listener
+                            // and keep serving instead.
+                            tracing::error!(
+                                %error,
+                                "config-server listener accept failed; recreating listener"
+                            );
+                            break;
+                        }
                     }
-                };
-                let info = tunnel.info().unwrap();
-                let client_url: url::Url = info.remote_addr.unwrap().into();
-                let location = Self::lookup_location(&client_url, geoip_db.clone());
-                tracing::info!(
-                    "New session from {:?}, secure: {}, location: {:?}",
-                    client_url,
-                    secure,
-                    location
-                );
-                let mut session = Session::new(
-                    storage.clone(),
-                    client_url.clone(),
-                    location,
-                    heartbeat_min_response_delay,
-                    feature_flags.clone(),
-                    webhook_config.clone(),
-                    next_session_epoch.fetch_add(1, Ordering::Relaxed) + 1,
-                );
-                session.serve(tunnel).await;
-                let session = Arc::new(session);
-                sessions.insert(client_url, session.clone());
-                session.mark_route_ready();
+                }
+                listeners_cnt.fetch_sub(1, Ordering::Relaxed);
+
+                // Rebind the same port with exponential backoff so clients can
+                // reconnect without an operator restarting the process.
+                loop {
+                    tokio::time::sleep(restart_backoff).await;
+                    restart_backoff = (restart_backoff * 2).min(Duration::from_secs(30));
+                    match make_listener() {
+                        Ok(mut new_listener) => match new_listener.listen().await {
+                            Ok(()) => {
+                                tracing::info!(
+                                    "config-server listener restarted on {}",
+                                    new_listener.local_url()
+                                );
+                                restart_backoff = Duration::from_secs(1);
+                                listener = new_listener;
+                                break;
+                            }
+                            Err(error) => {
+                                tracing::error!(
+                                    %error,
+                                    "failed to listen on recreated config-server listener; retrying"
+                                );
+                            }
+                        },
+                        Err(error) => {
+                            tracing::error!(
+                                %error,
+                                "failed to recreate config-server listener; retrying"
+                            );
+                        }
+                    }
+                }
+                listeners_cnt.fetch_add(1, Ordering::Relaxed);
             }
-            listeners_cnt.fetch_sub(1, Ordering::Relaxed);
         });
 
         Ok(local_url)
@@ -884,6 +940,7 @@ mod tests {
     use easytier_core::management::remote_client::{
         RemoteClientManager as _, Storage as RemoteStorage, ListNetworkProps,
     };
+    use easytier_core::{socket::SocketListener, tunnel::Tunnel};
     use serde_json::json;
     use sqlx::Executor;
 
@@ -1479,9 +1536,13 @@ mod tests {
     }
 
     async fn add_random_udp_listener(mgr: &mut ClientManager) -> std::net::SocketAddr {
-        let local_url = "udp://127.0.0.1:0".parse().unwrap();
-        let listener = runtime_udp_tunnel_listener(local_url, "127.0.0.1:0".parse().unwrap());
-        let local_url = mgr.add_listener(listener).await.unwrap();
+        let local_url: url::Url = "udp://127.0.0.1:0".parse().unwrap();
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let make_listener = move || {
+            Ok(Box::new(runtime_udp_tunnel_listener(local_url.clone(), addr))
+                as Box<dyn SocketListener<Accepted = Box<dyn Tunnel>>>)
+        };
+        let local_url = mgr.add_listener(make_listener).await.unwrap();
         local_url
             .socket_addrs(|| None)
             .unwrap()
@@ -1844,10 +1905,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_client() {
-        let listener = runtime_udp_tunnel_listener(
-            "udp://127.0.0.1:0".parse().unwrap(),
-            "127.0.0.1:0".parse().unwrap(),
-        );
         let mut mgr = ClientManager::new(
             Db::memory_db().await,
             None,
@@ -1857,7 +1914,13 @@ mod tests {
                 None, None, None, None, None,
             )),
         );
-        let listener_url = mgr.add_listener(listener).await.unwrap();
+        let make_listener = move || {
+            Ok(Box::new(runtime_udp_tunnel_listener(
+                "udp://127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1:0".parse().unwrap(),
+            )) as Box<dyn SocketListener<Accepted = Box<dyn Tunnel>>>)
+        };
+        let listener_url = mgr.add_listener(make_listener).await.unwrap();
 
         mgr.db()
             .inner()

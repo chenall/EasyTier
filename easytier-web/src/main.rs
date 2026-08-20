@@ -248,6 +248,29 @@ pub fn get_listener_by_url(
     })
 }
 
+/// Builds a `ClientManager::add_listener` factory for the given protocol/port.
+/// Returning a factory (instead of a one-shot listener) lets the manager
+/// transparently recreate the listener if its accept loop ever dies, so clients
+/// can reconnect without restarting the server.
+fn listener_factory(
+    protocol: String,
+    port: u16,
+    v6: bool,
+) -> impl Fn() -> anyhow::Result<Box<dyn SocketListener<Accepted = Box<dyn Tunnel>>>> {
+    let scheme: IpScheme = protocol.parse().expect("validated config server protocol");
+    let url: url::Url = if v6 {
+        format!("{protocol}://[::]:{port}")
+    } else {
+        format!("{protocol}://0.0.0.0:{port}")
+    }
+    .parse()
+    .expect("valid config server listen url");
+    move || {
+        get_listener_by_url(scheme, &url)
+            .ok_or_else(|| anyhow::anyhow!("failed to create config-server listener for {url}"))
+    }
+}
+
 async fn get_dual_stack_listener(
     protocol: &str,
     port: u16,
@@ -340,11 +363,17 @@ async fn main() {
     if v4_listener.is_none() && v6_listener.is_none() {
         panic!("Listen to both IPv4 and IPv6 failed");
     }
-    if let Some(listener) = v6_listener {
-        mgr.add_listener(listener).await.unwrap();
+    let protocol = cli.config_server_protocol.clone();
+    let port = cli.config_server_port;
+    if let Some(_listener) = v6_listener {
+        mgr.add_listener(listener_factory(protocol.clone(), port, true))
+            .await
+            .unwrap();
     }
-    if let Some(listener) = v4_listener {
-        mgr.add_listener(listener).await.unwrap();
+    if let Some(_listener) = v4_listener {
+        mgr.add_listener(listener_factory(protocol.clone(), port, false))
+            .await
+            .unwrap();
     }
 
     let mgr = Arc::new(mgr);

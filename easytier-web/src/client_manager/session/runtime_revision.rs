@@ -88,7 +88,9 @@ pub(super) async fn reconcile_network_configs_on_heartbeat(
             };
         }
         let running_metas =
-            match sync_running_sources_for_round(&mut rpc_client, &storage, &mut round).await {
+            match sync_running_sources_for_round(&mut rpc_client, &storage, &mut round, &mut cache)
+                .await
+            {
                 RoundStatus::Ready(running_metas) => running_metas,
                 RoundStatus::Skip => continue,
                 RoundStatus::Stop => return,
@@ -205,6 +207,11 @@ struct ReconcileCache {
     cleaned_web_source_instances: bool,
     last_desired_web_inst_ids: Option<HashSet<String>>,
     runtime_configs: SessionRuntimeConfigCache,
+    /// Instance ids that already reached a definitive seeding decision this
+    /// session (seeded successfully, or refused by the `web`-ownership guard).
+    /// Skipping them avoids re-issuing a device RPC + DB write every heartbeat
+    /// for a state that will not change until the device reconnects.
+    seeded_inst_ids: HashSet<String>,
 }
 
 #[derive(Default)]
@@ -511,6 +518,7 @@ async fn sync_running_sources_for_round(
     rpc_client: &mut SessionRpcClient,
     storage: &StorageInner,
     round: &mut ReconcileRound,
+    cache: &mut ReconcileCache,
 ) -> RoundStatus<Option<Vec<NetworkMeta>>> {
     if !round.req.support_config_source {
         return RoundStatus::Ready(None);
@@ -571,8 +579,14 @@ async fn sync_running_sources_for_round(
             // Mirror newly-discovered device-owned networks into the DB so they can
             // be surfaced (and taken over) while the device is offline. Best-effort:
             // a failure here must not abort the whole reconcile round.
-            if let Err(e) = seed_running_device_networks(&storage.db, rpc_client, round, &metas)
-                .await
+            if let Err(e) = seed_running_device_networks(
+                &storage.db,
+                rpc_client,
+                round,
+                &metas,
+                &mut *cache,
+            )
+            .await
             {
                 tracing::warn!(
                     user_id = ?round.user_id,
@@ -609,6 +623,7 @@ async fn seed_running_device_networks(
     rpc_client: &mut SessionRpcClient,
     round: &ReconcileRound,
     metas: &[NetworkMeta],
+    cache: &mut ReconcileCache,
 ) -> anyhow::Result<()> {
     if metas.is_empty() {
         return Ok(());
@@ -624,8 +639,9 @@ async fn seed_running_device_networks(
             continue;
         };
         let inst_id_str = inst_id.to_string();
-        if existing_ids.contains(&inst_id_str) {
-            // Already tracked; the source-sync path handles it.
+        if existing_ids.contains(&inst_id_str) || cache.seeded_inst_ids.contains(&inst_id_str) {
+            // Already tracked, or already reached a definitive decision this
+            // session. Either way there is nothing new to do this round.
             continue;
         }
         let Some(running_source) = config_source_from_rpc(meta.source) else {
@@ -669,7 +685,7 @@ async fn seed_running_device_networks(
             continue;
         };
 
-        if !db
+        match db
             .upsert_network_config_guarded(
                 (round.user_id, round.machine_id),
                 inst_id,
@@ -677,12 +693,26 @@ async fn seed_running_device_networks(
                 running_source,
             )
             .await
-            .map_err(|e| anyhow::anyhow!("failed to persist seeded network {inst_id_str}: {e}"))?
         {
-            tracing::debug!(
-                instance_id = ?inst_id,
-                "Seeding skipped an existing web-owned row (guard held)"
-            );
+            Ok(inserted) => {
+                // Both outcomes are definitive for the lifetime of this session:
+                // seeded => now tracked; refused => a web row exists and the guard
+                // will keep refusing. Mark seen to avoid retrying every heartbeat.
+                cache.seeded_inst_ids.insert(inst_id_str.clone());
+                if !inserted {
+                    tracing::debug!(
+                        instance_id = ?inst_id,
+                        "Seeding skipped an existing web-owned row (guard held)"
+                    );
+                }
+            }
+            Err(e) => {
+                // Transient DB failure: do NOT mark as seen so the next round
+                // retries the seed.
+                return Err(anyhow::anyhow!(
+                    "failed to persist seeded network {inst_id_str}: {e}"
+                ));
+            }
         }
     }
     Ok(())
@@ -1648,8 +1678,9 @@ mod tests {
         };
         let mut rpc: Box<dyn WebClientService<Controller = BaseController> + Send> =
             Box::new(MockWebClient { return_config: false });
+        let mut cache = ReconcileCache::default();
 
-        seed_running_device_networks(&db, &mut rpc, &round, &[meta])
+        seed_running_device_networks(&db, &mut rpc, &round, &[meta], &mut cache)
             .await
             .unwrap();
 
@@ -1690,8 +1721,9 @@ mod tests {
         };
         let mut rpc: Box<dyn WebClientService<Controller = BaseController> + Send> =
             Box::new(MockWebClient { return_config: true });
+        let mut cache = ReconcileCache::default();
 
-        seed_running_device_networks(&db, &mut rpc, &round, &[meta])
+        seed_running_device_networks(&db, &mut rpc, &round, &[meta], &mut cache)
             .await
             .unwrap();
 
