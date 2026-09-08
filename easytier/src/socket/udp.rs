@@ -58,6 +58,12 @@ impl RuntimeUdpSocket {
         if let Err(err) = udp_src::enable_recv_pktinfo(&socket) {
             tracing::debug!(?err, "enable udp pktinfo failed");
         }
+        // Prevent a transient ICMP Port Unreachable (e.g. a client that went
+        // offline) from poisoning the shared listening socket with WSAECONNRESET
+        // and wedging every session on it. See `disable_connreset` for details.
+        if let Err(err) = udp_src::disable_connreset(&socket) {
+            tracing::debug!(?err, "disable SIO_UDP_CONNRESET failed");
+        }
         Self { socket, context }
     }
 

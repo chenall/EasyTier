@@ -47,6 +47,11 @@ pub(crate) fn enable_recv_pktinfo(socket: &UdpSocket) -> io::Result<()> {
     Ok(())
 }
 
+pub(crate) fn disable_connreset(_socket: &UdpSocket) -> io::Result<()> {
+    // No-op on Unix: SIO_UDP_CONNRESET is Windows-specific behavior.
+    Ok(())
+}
+
 #[cfg(not(any(unix, windows)))]
 pub(crate) fn enable_recv_pktinfo(_socket: &UdpSocket) -> io::Result<()> {
     Ok(())

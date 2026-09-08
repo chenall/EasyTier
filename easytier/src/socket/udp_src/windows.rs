@@ -32,6 +32,44 @@ pub(crate) fn enable_recv_pktinfo(socket: &UdpSocket) -> io::Result<()> {
     Ok(())
 }
 
+/// Disable `SIO_UDP_CONNRESET` on a Windows UDP socket.
+///
+/// By default Windows turns an ICMP Port Unreachable (or any ICMP error) destined
+/// for a UDP socket into a `WSAECONNRESET` (10054) on the *next* receive. When a
+/// client goes away (sleep, killed process, expired NAT mapping) the server keeps
+/// sending to its old address, the peer replies with ICMP unreachable, and the
+/// shared listening socket then starts failing every `recv` with 10054 — which
+/// wedges the whole receive loop and drops every session on that listener until a
+/// process restart. Disabling `SIO_UDP_CONNRESET` makes `recv` only report errors
+/// for sockets that are genuinely connected to a dead peer, so transient ICMP
+/// noise no longer kills the socket.
+pub(crate) fn disable_connreset(socket: &UdpSocket) -> io::Result<()> {
+    use std::os::windows::io::AsRawSocket;
+
+    use windows::Win32::Networking::WinSock::{SIO_UDP_CONNRESET, SOCKET, WSAIoctl};
+
+    let disable: u32 = 0;
+    let mut bytes_returned: u32 = 0;
+    let ret = unsafe {
+        WSAIoctl(
+            SOCKET(socket.as_raw_socket() as usize),
+            SIO_UDP_CONNRESET,
+            Some(&disable as *const u32 as *const _),
+            std::mem::size_of_val(&disable) as u32,
+            None,
+            0,
+            &mut bytes_returned,
+            None,
+            None,
+        )
+    };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 #[cfg(not(any(unix, windows)))]
 pub(crate) fn enable_recv_pktinfo(_socket: &UdpSocket) -> io::Result<()> {
     Ok(())

@@ -9,6 +9,11 @@ pub(crate) fn enable_recv_pktinfo(_socket: &UdpSocket) -> io::Result<()> {
     Ok(())
 }
 
+pub(crate) fn disable_connreset(_socket: &UdpSocket) -> io::Result<()> {
+    // No-op fallback: SIO_UDP_CONNRESET is Windows-specific behavior.
+    Ok(())
+}
+
 pub(crate) async fn recv_from_with_dst_ip(
     socket: &UdpSocket,
     buf: &mut [u8],
