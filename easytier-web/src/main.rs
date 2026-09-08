@@ -220,9 +220,19 @@ impl LoggingConfigLoader for &Cli {
     }
 
     fn get_file_logger_config(&self) -> FileLoggerConfig {
+        // Default to writing a rolling log file under ./logs so that, even when
+        // the server runs detached/as a service, diagnostic output is persisted
+        // for post-mortem analysis of client-drop incidents. Both values can be
+        // overridden via --file-log-dir / --file-log-level.
         FileLoggerConfig {
-            dir: self.file_log_dir.clone(),
-            level: self.file_log_level.clone(),
+            dir: self
+                .file_log_dir
+                .clone()
+                .or_else(|| Some("logs".to_string())),
+            level: self
+                .file_log_level
+                .clone()
+                .or_else(|| Some("info".to_string())),
             file: None,
             size_mb: None,
             count: None,

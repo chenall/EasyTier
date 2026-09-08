@@ -90,17 +90,43 @@ impl ClientManager {
     ) -> Self {
         let client_sessions = Arc::new(DashMap::new());
         let sessions: Arc<DashMap<url::Url, Arc<Session>>> = client_sessions.clone();
+        let listeners_cnt = Arc::new(AtomicU32::new(0));
         let mut tasks = JoinSet::new();
-        tasks.spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-                sessions.retain(|_, session| session.is_running());
-            }
-        });
+        {
+            let sessions = sessions.clone();
+            let listeners_cnt = listeners_cnt.clone();
+            tasks.spawn(async move {
+                let mut cleanup_interval = tokio::time::interval(Duration::from_secs(15));
+                let mut health_interval = tokio::time::interval(Duration::from_secs(60));
+                loop {
+                    tokio::select! {
+                        _ = cleanup_interval.tick() => {
+                            let before = sessions.len();
+                            sessions.retain(|_, session| session.is_running());
+                            let removed = before - sessions.len();
+                            if removed > 0 {
+                                tracing::info!(
+                                    removed,
+                                    "config-server session cleanup: removed {} non-running sessions",
+                                    removed
+                                );
+                            }
+                        }
+                        _ = health_interval.tick() => {
+                            tracing::info!(
+                                listeners = listeners_cnt.load(Ordering::Relaxed),
+                                sessions = sessions.len(),
+                                "config-server health heartbeat"
+                            );
+                        }
+                    }
+                }
+            });
+        }
         ClientManager {
             tasks,
 
-            listeners_cnt: Arc::new(AtomicU32::new(0)),
+            listeners_cnt,
             next_session_epoch: Arc::new(AtomicU64::new(0)),
 
             client_sessions,
@@ -123,6 +149,7 @@ impl ClientManager {
         listener.listen().await?;
         let local_url = listener.local_url();
         self.listeners_cnt.fetch_add(1, Ordering::Relaxed);
+        tracing::info!(url = %local_url, "config-server listener started");
         let sessions = self.client_sessions.clone();
         let storage = self.storage.weak_ref();
         let listeners_cnt = self.listeners_cnt.clone();
@@ -132,12 +159,32 @@ impl ClientManager {
         let feature_flags = self.feature_flags.clone();
         let webhook_config = self.webhook_config.clone();
         self.tasks.spawn(async move {
-            let mut listener = listener;
+            // Hold the live listener in an Option so we can explicitly release
+            // (drop) the stale, still-bound socket before rebinding a fresh one.
+            // Without this, the old socket keeps the port occupied and every
+            // rebind fails with EADDRINUSE forever (prod symptom: an endless
+            // "failed to listen on recreated config-server listener; retrying /
+            // Address in use (os error 98)" loop).
+            let mut listener: Option<Box<dyn SocketListener<Accepted = Box<dyn Tunnel>>>> =
+                Some(listener);
             let mut restart_backoff = Duration::from_secs(1);
+            // Accept calls are capped at this duration so a genuinely hung accept
+            // (e.g. a Windows UDP socket poisoned by ICMP/WSAECONNRESET that hangs
+            // instead of erroring) cannot block the loop forever. A *healthy*
+            // listener that is merely idle (no clients for a while) is NOT a stall:
+            // only a real accept *error* triggers a recreate, so an idle config
+            // server is never torn down.
+            const ACCEPT_STALL_TIMEOUT: Duration = Duration::from_secs(120);
             loop {
+                let mut sock = listener
+                    .take()
+                    .expect("listener always present after recreate");
+                let mut ever_accepted = false;
                 loop {
-                    match listener.accept().await {
-                        Ok(tunnel) => {
+                    let accept = tokio::time::timeout(ACCEPT_STALL_TIMEOUT, sock.accept());
+                    match accept.await {
+                        Ok(Ok(tunnel)) => {
+                            ever_accepted = true;
                             let (tunnel, secure) =
                                 match web_security::accept_or_upgrade_server_tunnel(tunnel).await {
                                     Ok(v) => v,
@@ -172,7 +219,7 @@ impl ClientManager {
                             sessions.insert(client_url, session.clone());
                             session.mark_route_ready();
                         }
-                        Err(error) => {
+                        Ok(Err(error)) => {
                             // A single transient socket/listener error must never
                             // kill this listener permanently: that would drop every
                             // client on it and leave them unable to reconnect until
@@ -184,9 +231,27 @@ impl ClientManager {
                             );
                             break;
                         }
+                        Err(_elapsed) => {
+                            // Idle timeout, not a stall: a healthy listener simply
+                            // has no clients right now. Keep waiting instead of
+                            // tearing the socket down (the previous behaviour dropped
+                            // a working listener and then could never rebind).
+                            tracing::debug!(
+                                timeout_secs = ACCEPT_STALL_TIMEOUT.as_secs(),
+                                ever_accepted,
+                                "config-server listener idle for {}s; continuing to wait",
+                                ACCEPT_STALL_TIMEOUT.as_secs()
+                            );
+                            continue;
+                        }
                     }
                 }
                 listeners_cnt.fetch_sub(1, Ordering::Relaxed);
+
+                // Release the stale, still-bound socket so the port is free for the
+                // new bind. (Linux listeners set SO_REUSEADDR, so once the old
+                // socket is closed the rebind succeeds immediately.)
+                drop(sock);
 
                 // Rebind the same port with exponential backoff so clients can
                 // reconnect without an operator restarting the process.
@@ -201,7 +266,7 @@ impl ClientManager {
                                     new_listener.local_url()
                                 );
                                 restart_backoff = Duration::from_secs(1);
-                                listener = new_listener;
+                                listener = Some(new_listener);
                                 break;
                             }
                             Err(error) => {
@@ -269,6 +334,7 @@ impl ClientManager {
         let Some((_, session)) = self.client_sessions.remove(&client_url) else {
             return false;
         };
+        tracing::info!(%client_url, "force-disconnecting client session");
         session.stop().await;
         true
     }
