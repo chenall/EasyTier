@@ -7,7 +7,7 @@ use easytier_core::management::remote_client::{ListNetworkProps, PersistentConfi
 use entity::{preset_network_groups, user_running_network_configs};
 use sea_orm::{
     ColumnTrait as _, DatabaseConnection, DbErr, EntityTrait, QueryFilter as _, Set,
-    SqlxSqliteConnector, TransactionTrait as _, sea_query::OnConflict,
+    SqlxSqliteConnector, TransactionTrait as _, prelude::Expr, sea_query::OnConflict,
 };
 use sea_orm_migration::MigratorTrait as _;
 use sqlx::{Sqlite, SqlitePool, migrate::MigrateDatabase as _, types::chrono};
